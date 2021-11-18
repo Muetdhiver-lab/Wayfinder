@@ -26,6 +26,16 @@ a few utilites as :
 - display an orrery style plot with the trajectory arcs
 - display a job result as a flight plan in a text format
 
+## Structure of the folders
+
+- **Examples** provides a set 4 examples to get started and get a feel of what is possible and how. I recommend having a look there first :)
+- **Wayfinder Vanilla** contains a library of optimized MGA's for Vanilla KSP, along with a benchmarking script and the main script used to build / use 
+	the MGA library.
+- **Wayfinder JNSQ** contains a (small) library of optimized MGA's for the JNSQ planetpack, along with a benchmarking script and the main script used to build / use 
+	the MGA library.
+- **Wayfinder core** contains the core of the code
+
+
 ## Setting up a job :
 
 The amount of work required to setup decent jobs has been reduced to a minimum and streamlined as much as possible.
@@ -113,7 +123,8 @@ and tricks :
 - **Pe/Ap of Arcs** are given. This can help a lot to see if the trajectory obtained is correct or not. If the Pe or Ap of a trajectory segment is wrong, then correction is required.
 
 
-## Examples
 
-The example folder contains 4 examples to get started and get a feel of what is possible and how. I recommend having a look there first :)
 
+## Installation
+
+I can only speak about my setup, which is winpython 3.6 and/or 3.7, along with pykep and pygmo.

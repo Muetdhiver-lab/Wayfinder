@@ -4,7 +4,7 @@ Wayfinder is a Multiple Gravity Assist search tool for KSP.
 It's goal is to allow efficient search of gravity assist sequences using state of the art tools using pykep/pygmo
 packages from ESA. At the moment it's a set of python scripts with no GUI.
 
-## References and requirements : 
+## References : 
 This work would not have been possible without 
 - pykep : https://esa.github.io/pykep/ 
 - pygmo : https://esa.github.io/pygmo2/
@@ -78,7 +78,7 @@ and is able to guess reasonnable ToF boundaries if wished.
 
 ## Running a job :
 
-Once a job has been configured, starting the optimizer is just a matter of loading the file and calling the 
+Once a job has been configured, starting the optimizer is just a matter of loading the file and calling the optimize method
 
 	swing_by_bodies = [["Kerbin"],["Duna"],["Eve"],["Kerbin"]]
 	plans.load_df()  
@@ -87,7 +87,7 @@ Once a job has been configured, starting the optimizer is just a matter of loadi
 
 
 Once the jobs are setup, Wayfinder can search for solutions for each job. Several optimization levels with varying computational costs are pre-configured. 
-Job can be edited in batch to change the optimization level or the orbital insertion  if required.
+Job can be edited in batch to change the optimization level or the orbital insertion if required.
 
 Once optimized, the results (gene encoding the solution) are saved along with all the job parameters and the resulting total DV cost, time of flight and lauch date.
 
@@ -128,3 +128,5 @@ and tricks :
 ## Installation
 
 I can only speak about my setup, which is winpython 3.6 and/or 3.7, along with pykep and pygmo.
+
+Enjoy

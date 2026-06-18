@@ -1,11 +1,11 @@
- # This is a short use guide/readme for wayfinder v1.4
+ # This is a short use guide/readme for wayfinder v1.6
 
 Wayfinder is a ksp utility allowing for efficient search of gravity assist sequences using state of the art tools using the awesome pykep/pygmo
 package from ESA ACT. At the moment it's a set of python scripts with no GUI.
 
 ## How does it work :
 
-Wayfinder uses a job batch system with the results of said jobs saved in an xslx format for storage and readability. 
+Wayfinder uses a job batch system. SQLite is the datastore for comparing jobs across batches and binning strategies.
 Jobs can be added with the desired parameters (fly-by sequence, insertion type, search space bining, optimizsation level and so on).
 Once added, jobs can be run in batches, and results will be saved. Once results are saved, the results can be searched and accessed with
 a few utilites as : 
@@ -16,13 +16,18 @@ a few utilites as :
 - display an orrery style plot with the trajectory arcs
 - display a job result as a flight plan in a text format
 
+SQLite stores wildcard batch templates separately from concrete generated sequences and jobs. This allows queries such as "best known Kerbin to Moho result in this launch window" across all stored batches, even if the jobs were generated with different bins.
+
 ## Setting up a job :
 
 The amount of work required to setup decent jobs has been reduced to a minimum and streamlined as much as possible.
 This does not mean that one cannot go beyond what is preset, but ease of use was the focus. As an example, here is the code to setup
 a search for transfers to Moho using either a KEEMo or KEMo flyby sequence for lauch dates from 0 to 1000 with a search binning of 100 days :
 
-	plans.add_batch(
+	db_path = "wayfinder.sqlite"
+	plans.add_batch_sqlite(
+            db_path         = db_path,
+            batch_name      = "Moho_Eve_window_scan",
             swing_by_bodies = [["Kerbin"],["Eve"],["Eve","*"],["Moho"]],
             t0_min          = 0,
             t0_bin          = 100,
@@ -49,8 +54,8 @@ Here, several options require explanations :
 	+	"circular" injections means that the optimizer will include the cost of an injection into a circular orbit.
 - **injection alt** 	: target altitude for the orbital injection at destination, if the orbit is circular or elliptical (pe).
 - **ejection alt**  	: parking orbit altitude from which ejection will be done.
-- **overwrite**			: if "True" configured jobs that have the same keys (sequence, min_t0 and min_tof) are overwritten. Otherwise not. Default is set to "False"
-- **datastore_name** 	: if working with non default datastore (xlsx sheet), provide the name of the file.
+- **db_path** 			: SQLite database path. A single database can store several planet packs, batches, binning strategies and result sets.
+- **batch_name** 		: human-readable name for a generation/optimization campaign.
 
 
 Each job corresponds to a gravity assist sequence with boundaries on ToF and launch dates. Wayfinder can generate such jobs in batches,
@@ -58,17 +63,19 @@ and is able to guess reasonnable ToF boundaries if wished.
 
 ## Running a job :
 
-Once a job has been configured, starting the optimizer is just a matter of loading the file and calling the 
+Once a job has been configured, starting the optimizer is just a matter of selecting pending jobs from SQLite:
 
 	swing_by_bodies = [["Kerbin"],["Duna"],["Eve"],["Kerbin"]]
-	plans.load_df()  
-	plans.optimize(n=20)
-	plans.find_best_plan(swing_by_bodies,t0_range=[0,4000])
+	db_path = "wayfinder.sqlite"
+	plans.optimize_sqlite(db_path, n=20, batch_name="Duna_Eve_Kerbin_scan")
+	plans.find_best_known_plan_sqlite(
+            db_path=db_path,
+            batch_name="Duna_Eve_Kerbin_scan",
+            start_body="Kerbin",
+            t0_range=[0,4000])
 
 
 Once the jobs are setup, Wayfinder can search for solutions for each job. Several optimization levels with varying computational costs are pre-configured. 
-Job can be edited in batch to change the optimization level or the orbital insertion  if required.
-
 Once optimized, the results (gene encoding the solution) are saved along with all the job parameters and the resulting total DV cost, time of flight and lauch date.
 
 Wayfinder then allows to search the job library for the best route in a given lauch window and/or compare different possible routes (sequences) 

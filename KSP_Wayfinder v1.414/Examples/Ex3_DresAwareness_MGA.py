@@ -18,15 +18,18 @@ sys.path.append("../WayfinderCore")
    
 from _Wayfinder import Wayfinder 
 
+DB_PATH = "wayfinder_examples.sqlite"
+BATCH_NAME = "Ex3_DresAwareness"
+
 def gen_vanillaDres_ex3():
 
     plans = Wayfinder(planet_pack = "Vanilla")
     
     swing_by_bodies = [["Kerbin"],["Kerbin","Eve"],["Kerbin","Duna"],["Dres"]]
     
-    plans.add_batch(
-        datastore_name  = 'Ex3_DresAwareness',
-        overwrite       = True,
+    plans.add_batch_sqlite(
+        db_path         = DB_PATH,
+        batch_name      = BATCH_NAME,
         swing_by_bodies = swing_by_bodies,
         t0_min          = 0,
         t0_bin          = 200,
@@ -40,13 +43,26 @@ def run_vanillaDres_ex3():
 
 
     plans = Wayfinder(planet_pack = "Vanilla")
-    plans.load_df(datastore_name = 'Ex3_DresAwareness')  
-    swing_by_bodies = [["Kerbin"],["Kerbin","Eve"],["Kerbin","Duna"],["Dres"]]
     for i in range(4):
-        plans.optimize(n=3)
-    plans.find_best_plan(swing_by_bodies,t0_range=[0,1000])
-    plans.plot_by_sequences(swing_by_bodies,t0_range=[0,1000])
-    plans.plot_DVvsT0(swing_by_bodies,t0_range=[0,1000])
+        plans.optimize_sqlite(DB_PATH, n=3, batch_name=BATCH_NAME)
+    plans.find_best_known_plan_sqlite(
+        db_path=DB_PATH,
+        batch_name=BATCH_NAME,
+        start_body="Kerbin",
+        target_body="Dres",
+        t0_range=[0,1000])
+    plans.plot_by_sequences_sqlite(
+        db_path=DB_PATH,
+        batch_name=BATCH_NAME,
+        start_body="Kerbin",
+        target_body="Dres",
+        t0_range=[0,1000])
+    plans.plot_DVvsT0_sqlite(
+        db_path=DB_PATH,
+        batch_name=BATCH_NAME,
+        start_body="Kerbin",
+        target_body="Dres",
+        t0_range=[0,1000])
 
 ''' This is required to avoid issues with mutiprocessing '''
 if __name__ == "__main__":

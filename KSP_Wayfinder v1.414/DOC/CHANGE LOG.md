@@ -39,6 +39,32 @@
 - added DV vs T0 plot for aritrary sequences in all possible forms, including combinatorial. Very nice.
 - added a few tests
 
+### v1.6.0
+
+- SQLite is now the only Wayfinder datastore for jobs, runs, results and genes.
+- `add_batch` and `optimize` now require an explicit SQLite path, with `add_batch_sqlite` and `optimize_sqlite` as the preferred workflow.
+- SQL result display/query helpers now support `batch_name` filtering to compare batches without mixing binning strategies.
+- Regression references moved to a SQLite fixture.
+- The old dataframe file load/save path has been removed from the core API.
+- The core is now pykep3-only; pykep2 compatibility shims were removed and a regression guard prevents reintroducing them.
+- Old Excel datastores were moved under `legacy/`.
+- Planet definitions moved under `WayfinderCore/planet_packs/`.
+- `_Kraken_Patch.py` was renamed to `_Trajectory.py` now that trajectory decoding/display is standalone and no longer monkey patches pykep.
+- Non-flight-plan diagnostics now use the standard `logging` module; `transx` keeps direct console output for readable flight plans.
+- Wayfinder optimization fitness decoration was moved out of `optimize` into a dedicated optimization module.
+- SQLite now stores optimizer run snapshots with per-step champion fitness and genes.
+- SQLite now stores final optimizer populations so non-winning genes can be reused for local porkchop analysis.
+- Added a local porkchop plot helper for stored optimizer genes.
+- Added explicit optimizer porkchop and sampled local porkchop helpers, with sampled grids stored in SQLite.
+
+### v1.5.0
+
+- added a SQLite datastore layer for jobs, batches, sequences, runs, results and genes.
+- wildcard batch templates are stored separately from concrete generated sequences.
+- concrete sequences are normalized with start/target/flyby metadata, allowing route-wide queries such as best known Kerbin to Moho result across batches.
+- jobs are deduplicated with a canonical parameter hash so different binning strategies can coexist cleanly.
+- pykep3 compatibility added while keeping pykep2 regression coverage.
+
 ### v1.414
 
 - added examples of use for different cases

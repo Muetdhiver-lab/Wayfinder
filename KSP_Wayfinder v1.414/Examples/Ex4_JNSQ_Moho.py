@@ -15,15 +15,18 @@ sys.path.append("../WayfinderCore")
    
 from _Wayfinder import Wayfinder 
 
+DB_PATH = "wayfinder_examples.sqlite"
+BATCH_NAME = "Ex4_JNSQ_Moho"
+
 def gen_JNSQ_Moho_ex4():
 
     plans = Wayfinder(planet_pack = "JNSQ")
     
     swing_by_bodies = [["Kerbin"],["Eve"],["Eve","*"],["Moho"]]
     
-    plans.add_batch(
-        datastore_name  = 'Ex4_JNSQ_Moho',
-        overwrite       = True,
+    plans.add_batch_sqlite(
+        db_path         = DB_PATH,
+        batch_name      = BATCH_NAME,
         swing_by_bodies = swing_by_bodies,
         t0_min          = 0,
         t0_bin          = 200,
@@ -31,21 +34,27 @@ def gen_JNSQ_Moho_ex4():
         tof_min         = 300,
         tof_bin         = 150,
         n_tof_bins      = 2,   
-        opt_level       = "high",
-        opt_injection   = "circular",
+        opt_level       = "moderate",
+        opt_injection   = "vinf",
         injection_altitude = 100000)
     
 def run_JNSQ_Moho_ex4(): 
 
 
     plans = Wayfinder(planet_pack = "JNSQ")
-    plans.load_df(datastore_name = 'Ex4_JNSQ_Moho')  
-    swing_by_bodies = [["Kerbin"],["Eve"],["Eve","*"],["Moho"]]
-    plans.edit_batch(swing_by_bodies, action = "inj:vinf")
-    plans.edit_batch(swing_by_bodies, action = "lvl:moderate")
-    plans.optimize(n=8)
-    plans.find_best_plan(swing_by_bodies,t0_range=[0,1000])
-    plans.plot_by_sequences(swing_by_bodies,t0_range=[0,1000])
+    plans.optimize_sqlite(DB_PATH, n=8, batch_name=BATCH_NAME)
+    plans.find_best_known_plan_sqlite(
+        db_path=DB_PATH,
+        batch_name=BATCH_NAME,
+        start_body="Kerbin",
+        target_body="Moho",
+        t0_range=[0,1000])
+    plans.plot_by_sequences_sqlite(
+        db_path=DB_PATH,
+        batch_name=BATCH_NAME,
+        start_body="Kerbin",
+        target_body="Moho",
+        t0_range=[0,1000])
 
 ''' This is required to avoid issues with mutiprocessing '''
 if __name__ == "__main__":

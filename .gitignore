@@ -127,3 +127,11 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Wayfinder generated outputs and local datastore sidecars
+Wayfinder-main.zip
+KSP_Wayfinder v1.414/Tests/*.png
+KSP_Wayfinder v1.414/Tests/tmp*/
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal

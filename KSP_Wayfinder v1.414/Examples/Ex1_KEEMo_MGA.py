@@ -13,15 +13,18 @@ sys.path.append("../WayfinderCore")
    
 from _Wayfinder import Wayfinder 
 
+DB_PATH = "wayfinder_examples.sqlite"
+BATCH_NAME = "Ex1_KEEMo_MGA"
+
 def gen_vanilla_mga_ex1():
 
     plans = Wayfinder(planet_pack = "Vanilla")
     
     swing_by_bodies = [["Kerbin"],["Eve"],["Eve"],["Moho"]]
     
-    plans.add_batch(
-        datastore_name  = 'Ex1_KEEMo_MGA',
-        overwrite       = True,
+    plans.add_batch_sqlite(
+        db_path         = DB_PATH,
+        batch_name      = BATCH_NAME,
         swing_by_bodies = swing_by_bodies,
         t0_min          = 0,
         t0_bin          = 1000,
@@ -34,11 +37,14 @@ def gen_vanilla_mga_ex1():
 def run_vanilla_mga_ex1(): 
 
 
-    plans = Wayfinder(planet_pack = "Vanilla",datastore_name = 'Ex1_KEEMo_MGA')
-    plans.load_df(datastore_name = 'Ex1_KEEMo_MGA')  
+    plans = Wayfinder(planet_pack = "Vanilla",datastore_name = BATCH_NAME)
     swing_by_bodies = [["Kerbin"],["Eve"],["Eve"],["Moho"]]
-    plans.optimize(n=1)
-    plans.find_best_plan(swing_by_bodies,t0_range=[0,1000])
+    plans.optimize_sqlite(DB_PATH, n=1, batch_name=BATCH_NAME)
+    plans.find_best_known_plan_sqlite(
+        db_path=DB_PATH,
+        batch_name=BATCH_NAME,
+        sequence_short_name="KEEMo",
+        t0_range=[0,1000])
 
 
 ''' This is required to avoid issues with mutiprocessing '''

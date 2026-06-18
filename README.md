@@ -22,6 +22,9 @@ strategy.
 The directory name is historical; the authoritative release number is stored
 in `VERSION`.
 
+See [`DEVELOPMENT.md`](DEVELOPMENT.md) before continuing active development
+from another machine or coding session.
+
 See [`KSP_Wayfinder v1.414/DOC/README.md`](KSP_Wayfinder%20v1.414/DOC/README.md)
 for the usage guide and
 [`KSP_Wayfinder v1.414/DOC/CHANGE LOG.md`](KSP_Wayfinder%20v1.414/DOC/CHANGE%20LOG.md)

@@ -1,142 +1,134 @@
-# Wayfinder Development Status
+# Wayfinder development handoff
 
-Last updated: 2026-06-18
+Last updated: 2026-06-22
 
-This document is the handoff point for continuing Wayfinder development from a
-new machine or a new coding session. Read it together with `README.md` and the
-release changelog.
+This file is the short operational handoff. The detailed workflow, class and
+database diagrams, benchmark history and GUI-readiness critique are in
+[`KSP_Wayfinder v1.6.0/DOC/RELEASE_ARCHITECTURE_REVIEW_1.6.0.md`](KSP_Wayfinder%20v1.6.0/DOC/RELEASE_ARCHITECTURE_REVIEW_1.6.0.md).
 
-## Current release work
+## Release state
 
-- Target release: `v1.6.0`
-- Development branch: `codex/release-v1.6.0`
-- Draft pull request: https://github.com/Muetdhiver-lab/Wayfinder/pull/1
-- Last release commit at the time of writing: `90690af`
-- Public `main` still represents the historical `v1.414` code until the pull
-  request is merged.
-- The directory name `KSP_Wayfinder v1.414` is historical. The authoritative
-  version is stored in the root `VERSION` file.
+- Target release: `v1.6.0`.
+- Development branch: `codex/release-v1.6.0`.
+- Authoritative version: root `VERSION` and `WAYFINDER_VERSION` in
+  `_Wayfinder.py`, both `1.6.0`.
+- SQLite schema: **14**.
+- Active datastore: SQLite only; Excel files are historical fixtures under
+  `legacy/`.
+- Core runtime: pykep 3 / pygmo 2, Python 3.10.
 
-## Supported runtime
+The core directory follows the authoritative release version:
+`KSP_Wayfinder v1.6.0`.
 
-- Python environment used during development:
-  `C:\MyPrograms\MiniConda\envs\Wayfinder-pykep3`
-- pykep: `3.0.0`
-- pygmo: `2.19.8`
-- Wayfinder is now pykep3-only. Reintroducing the old pykep2 wrapper or monkey
-  patch is covered by a regression guard.
+## Reproducible environment
 
-The exact environment path is machine-specific. A reproducible environment
-file still needs to be added before `v1.6.0` is finalized.
-
-## Architecture
-
-Core modules live under `KSP_Wayfinder v1.414/WayfinderCore`:
-
-- `_Wayfinder.py`: public orchestration API, batch generation, optimization
-  workflow, queries, and plotting entry points.
-- `_SQLiteStore.py`: versioned SQLite schema, migrations, jobs, batches, runs,
-  results, genes, benchmarks, and porkchop samples. Current schema version: 7.
-- `_Optimization.py`: optimization fitness decoration and related helpers.
-- `_Trajectory.py`: trajectory decoding, metrics, plotting support, and TransX
-  flight-plan output. It replaces the former `_Kraken_Patch.py` monkey patch.
-- `planet_packs/`: Vanilla and JNSQ definitions. Keep the term `planet_packs` in
-  APIs and documentation because that is the KSP community terminology.
-
-SQLite is the only active datastore. Excel files and obsolete scripts are kept
-under `legacy/` for historical reference only. Pandas remains acceptable at the
-analysis and plotting boundary, but is no longer optimizer or datastore state.
-
-## Important design decisions
-
-- A single SQLite database may contain multiple planet packs. Every relevant
-  row is scoped by `planet_pack`.
-- Canonical parameter hashes deduplicate jobs while allowing different binning
-  strategies to coexist.
-- Benchmark batches use `purpose="benchmark"` and are excluded from normal
-  result queries unless `include_benchmarks=True` is requested.
-- Optimizer runs retain snapshots and final populations, not only the winning
-  gene. These genes support local refinement and porkchop analysis.
-- Alpha genes can be converted to direct encoding. A direct re-optimization of
-  the difficult Vanilla KEKKJ solution preserved and slightly improved its
-  objective (`2876.8206` to `2876.8034` m/s), validating the conversion path.
-- Injection/capture metrics are separated from stored trajectory results so
-  alternative injection assumptions can be evaluated without re-optimizing.
-- Non-TransX diagnostics use Python logging. TransX output intentionally still
-  uses direct console printing.
-- Automatic worker selection uses the detected CPU count minus two reserved
-  cores, while allowing an explicit island count.
-
-## Tests
-
-Run from `KSP_Wayfinder v1.414`:
+From the repository root:
 
 ```powershell
-& 'C:\MyPrograms\MiniConda\envs\Wayfinder-pykep3\python.exe' `
-  -m unittest discover -s Tests -p 'test_*.py' -v
+conda env create -f environment.yml
+conda activate wayfinder
+cd 'KSP_Wayfinder v1.6.0'
+python -m pytest -q
 ```
 
-Current result: 27 tests passing.
+The validated environment pins Python 3.10.20, pykep 3.0.0, pygmo 2.19.8,
+NumPy 2.2.6, SciPy 1.15.2, NetworkX 3.4.2, pandas 2.3.3,
+Matplotlib 3.10.9 and seaborn 0.13.2.
 
-The test suite covers SQLite migrations and queries, benchmark filtering,
-optimizer metadata and snapshots, plotting data selection, known Vanilla and
-JNSQ trajectory decoding, time scaling, ejection geometry, alpha-to-direct
-conversion, topology construction, CPU/island selection, and the pykep2 monkey
-patch guard.
+On Windows, activate the environment or use `conda run`. Invoking its
+`python.exe` directly without `<env>\Library\bin` in `PATH` can produce delayed
+native-DLL crashes during plotting even though imports succeed.
 
-The eight committed SQLite files in `Tests/` are intentional reference and
-benchmark snapshots. Treat them as immutable fixtures where possible; repeated
-binary rewrites would unnecessarily increase Git history.
+## Current architecture
 
-## Known local warning
+Core modules under `KSP_Wayfinder v1.6.0/WayfinderCore`:
 
-Heyoka may warn that it cannot enable WAL mode for:
+- `_Wayfinder.py`: public façade, job generation, Pygmo orchestration,
+  refinement and plots;
+- `_SQLiteStore.py`: schema v14, atomic job leases, runs, results, optimizer
+  telemetry and porkchop samples;
+- `_Optimization.py`: ToF encoding and fitness decoration;
+- `_Trajectory.py`: canonical ejection calculation, decoding and TransX;
+- `planet_packs/`: Vanilla and JNSQ definitions.
 
-`C:\Users\vfave\AppData\Local\heyoka\cache\cache.db`
+The public optimizer default for 1.6 remains deliberately
+`optimizer_strategy="funnel"`, the corrected three-stage reference. The newer
+`funnel_scout_archive`, `_32`, `_64` and `_128` strategies remain explicit
+research options. The 128-island L0 variant is rejected; 32 islands is the next
+candidate to repeat before any default changes.
 
-The cache file exists, but the local environment may prevent creation of its
-WAL sidecar. This has no observed numerical or test impact; it only disables
-effective use of the on-disk compilation cache.
+## Job lifecycle and schema v14
 
-## Optimization benchmark status
+`optimize_sqlite()` no longer reads naked `TODO` rows. It atomically claims
+jobs using `BEGIN IMMEDIATE` and stores:
 
-The first topology experiments compare `fully_connected`, `ring`, and
-`unconnected` archipelagos on:
+- `status = RUNNING`;
+- `claimed_at`;
+- `claim_expires_at`;
+- `worker_id`.
 
-- JNSQ KEEMo in the known useful launch window.
-- Vanilla KEKKJ using a difficult but direct-validated `v_inf` minimum.
+Expired leases are returned to `TODO` on the next claim. Claims may be renewed,
+and terminal statuses clear ownership fields. `optimize_sqlite()` claims only
+the next job it is about to start, renews the active lease between Pygmo epochs,
+and atomically publishes run, result, gene and final job status only when the
+same `worker_id` and `claimed_at` still own a live claim. A stale worker is
+therefore fenced out after recovery.
 
-Initial single-trial results exist in
-`Tests/topology_benchmark_bunch1.sqlite`. Additional KEKKJ searches and direct
-validation are stored in the other committed benchmark databases.
+Stage telemetry now persists `topology_name`, `migration_rate` and
+`exact_archive_size`, in addition to topology dimensions and migration counts.
 
-Do not interpret one optimizer seed as a deterministic replay: pygmo
-archipelagos and multiprocessing did not reproduce identical populations from
-the same global seed. Repeated runs should be treated as statistical trials.
+## Optimization decisions
 
-## Next development steps
+- New searches should prefer direct per-leg ToF encoding and bin only `T0`.
+- The default topology is ring, with migration rate 2 in the funnel.
+- Pygmo algorithms only: SADE, simulated annealing and
+  `pg.nlopt("neldermead")`.
+- Exact ejection chooses the cheaper direct-inclined or planar-plus-SOI-split
+  strategy and is shared by fitness and decoding.
+- The research scout/archive funnel preserves phase-diverse exact candidates
+  across L1/L2 and uses adaptive exact L3 refinement.
+- Pygmo multiprocessing migration is asynchronous; a repeated seed does not
+  imply a bitwise deterministic archipelago history.
 
-1. Add a reproducible pykep3 environment specification and verify setup from a
-   clean machine.
-2. Complete the topology benchmark with several trials for KEEMo and KEKKJ,
-   then compare success rate, best objective, dispersion, and runtime.
-3. Decide whether optimizer `seed` should be renamed to `trial_seed`, or seed
-   individual islands explicitly if pygmo provides a robust path.
-4. Review the optimization funnel after topology results: island/population
-   balance, algorithm mix, migration policy, and phase transition criteria.
-5. Continue the planned re-optimization and locally refined porkchop workflow.
-6. Design the future GUI only after the optimizer and persistence APIs are
-   stable. NiceGUI is currently the leading lightweight option; Qt was judged
-   unnecessarily heavy for this project.
+## Verification
 
-## Starting on another machine
-
-Before the pull request is merged:
+Run from `KSP_Wayfinder v1.6.0`:
 
 ```powershell
-git clone https://github.com/Muetdhiver-lab/Wayfinder.git
-cd Wayfinder
-git switch codex/release-v1.6.0
+python -m pytest -q
+python -m compileall -q WayfinderCore Tests
 ```
 
-After merge, use `main` and the eventual `v1.6.0` tag instead.
+Current suite: **52 tests** (14 datastore and 38 regression tests). It covers
+v13-to-v14 migration, atomic claims, lease recovery and stale-worker fencing,
+topology/migration,
+funnels, exact archive, adaptive stopping, Vanilla/JNSQ decoding, exact
+ejection consistency and SQLite analysis paths.
+
+The standalone `Tests/run_*.py` scripts are benchmarks/smoke harnesses and are
+not all part of pytest.
+
+## Release 1.6 scope audit
+
+The two tracked SQLite fixtures are intentionally part of the release. Both
+were migrated through `SQLiteJobStore` to schema v14 and pass SQLite integrity
+and foreign-key checks. The six PNG files under `DOC/assets` are the benchmark
+figures referenced by the architecture review. Python/pytest caches and SQLite
+WAL, SHM or journal files are generated artifacts and are not release inputs.
+
+## Known environment warning
+
+Heyoka may warn that it cannot write its on-disk cache under the local user
+profile. This has no observed numerical effect but removes effective cache
+reuse and can distort cold/warm runtime comparisons.
+
+## Next work after the core release
+
+1. Commit and tag the intentionally reviewed release scope.
+2. Extract a transactional `SQLiteRepository` and observable
+   `OptimizationService` behind the existing façade.
+3. Add GUI-safe progress, cancellation and crash recovery.
+4. Separate plot data models from Matplotlib rendering.
+5. Repeat the 32-island L0 qualification before reconsidering the optimizer
+   default.
+6. Develop the planar/normal `v_inf` two-dimensional ejection surrogate.

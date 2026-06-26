@@ -93,6 +93,19 @@ seed effective et le même hash de configuration.
 
 La suite atteint maintenant 58 tests et 9 sous-tests.
 
+## Tranche 5
+
+`StageConfig` et `FunnelConfig` introduisent une représentation typée mais
+transitoire du funnel. Ces objets ne changent pas encore l'exécution Pygmo :
+ils servent à produire exactement les dictionnaires canoniques déjà consommés
+par `Wayfinder` et persistés en JSON dans SQLite.
+
+La règle de compatibilité reste stricte : `StageConfig.to_dict()` et
+`FunnelConfig.to_dict()` doivent reproduire bit-à-bit les structures historiques
+validées par les hashes de tests. Le moteur continue donc de lire des dicts,
+tandis que la couche configuration dispose désormais d'un point d'ancrage plus
+propre pour la future GUI.
+
 ## Tranche suivante proposée
 
 Ne pas déplacer immédiatement `_run_sqlite_funnel_job`, qui mélange encore

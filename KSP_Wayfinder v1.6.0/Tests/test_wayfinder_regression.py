@@ -39,6 +39,7 @@ from _Trajectory import fast_ejection_from_gene  # noqa: E402
 from _Trajectory import _safe_acos  # noqa: E402
 from _Optimization import WayfinderFitnessDecorator  # noqa: E402
 from _OptimizationService import OptimizationService  # noqa: E402
+from _OptimizationService import StageConfig, FunnelConfig  # noqa: E402
 import pykep as pk  # noqa: E402
 import pygmo as pg  # noqa: E402
 from pykep.trajopt import mga_1dsm  # noqa: E402
@@ -317,6 +318,51 @@ class WayfinderRegressionTests(unittest.TestCase):
                 self.assertEqual(
                     hashlib.sha256(payload).hexdigest(), expected_digest,
                 )
+
+    def test_funnel_config_objects_round_trip_to_canonical_dicts(self):
+        stages = OptimizationService.funnel_stage_plan(
+            16, 32, 20, 20, exact_strategy="scout_archive_nm_32",
+        )
+        stage_round_trip = [StageConfig.from_dict(stage).to_dict() for stage in stages]
+        self.assertEqual(stage_round_trip, stages)
+
+        requested = {
+            "n_islands": 16,
+            "island_pop": 32,
+            "evo_steps": 20,
+            "sade_gen": 20,
+        }
+        funnel = FunnelConfig.from_stage_dicts(
+            "funnel_scout_archive_32",
+            "scout_archive_nm_32",
+            requested,
+            stages,
+        )
+        expected = {
+            "kind": "funnel",
+            "optimizer_strategy": "funnel_scout_archive_32",
+            "exact_strategy": "scout_archive_nm_32",
+            "requested": requested,
+            "stages": stages,
+        }
+
+        self.assertEqual(funnel.to_dict(), expected)
+        self.assertEqual(
+            OptimizationService.funnel_run_config(
+                "funnel_scout_archive_32", 16, 32, 20, 20,
+            ),
+            expected,
+        )
+        self.assertEqual(
+            hashlib.sha256(
+                json.dumps(
+                    funnel.to_dict(), sort_keys=True, separators=(",", ":"),
+                ).encode()
+            ).hexdigest(),
+            hashlib.sha256(
+                json.dumps(expected, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        )
 
     def test_funnel_stage_plan_enforces_sade_minimum_population(self):
         stages = Wayfinder._funnel_stage_plan(1, 1, 1, 1)

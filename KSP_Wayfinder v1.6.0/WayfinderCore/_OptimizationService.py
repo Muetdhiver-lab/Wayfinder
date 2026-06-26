@@ -6,11 +6,103 @@ points remain on the facade while optimizer policy moves into testable helpers.
 
 import json
 import os
+from dataclasses import dataclass, field
 
 import numpy as np
 import pygmo as pg
 
 from _Optimization import alpha_leg_tofs, direct_leg_tofs
+
+
+@dataclass
+class StageConfig:
+    """Serializable description of one optimizer funnel stage."""
+
+    name: str
+    n_island: int
+    island_pop: int
+    evo_steps: int
+    sade_gen: int
+    ejection_model: str
+    initialization: str
+    algorithm: str
+    options: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, values):
+        required = {
+            "name", "n_island", "island_pop", "evo_steps", "sade_gen",
+            "ejection_model", "initialization", "algorithm",
+        }
+        missing = sorted(required - set(values))
+        if missing:
+            raise ValueError(
+                "Missing stage configuration fields: " + ", ".join(missing)
+            )
+        options = {
+            key: value for key, value in dict(values).items()
+            if key not in required
+        }
+        return cls(
+            name=str(values["name"]),
+            n_island=int(values["n_island"]),
+            island_pop=int(values["island_pop"]),
+            evo_steps=int(values["evo_steps"]),
+            sade_gen=int(values["sade_gen"]),
+            ejection_model=str(values["ejection_model"]),
+            initialization=str(values["initialization"]),
+            algorithm=str(values["algorithm"]),
+            options=options,
+        )
+
+    def to_dict(self):
+        values = {
+            "name": self.name,
+            "n_island": int(self.n_island),
+            "island_pop": int(self.island_pop),
+            "evo_steps": int(self.evo_steps),
+            "sade_gen": int(self.sade_gen),
+            "ejection_model": self.ejection_model,
+            "initialization": self.initialization,
+            "algorithm": self.algorithm,
+        }
+        values.update(self.options)
+        return values
+
+
+@dataclass
+class FunnelConfig:
+    """Serializable optimizer funnel preset."""
+
+    name: str
+    exact_strategy: str
+    requested: dict
+    stages: list
+    kind: str = "funnel"
+
+    @classmethod
+    def from_stage_dicts(
+        cls, name, exact_strategy, requested, stage_dicts, kind="funnel",
+    ):
+        return cls(
+            name=str(name),
+            exact_strategy=str(exact_strategy),
+            requested=dict(requested),
+            stages=[StageConfig.from_dict(stage) for stage in stage_dicts],
+            kind=str(kind),
+        )
+
+    def stage_dicts(self):
+        return [stage.to_dict() for stage in self.stages]
+
+    def to_dict(self):
+        return {
+            "kind": self.kind,
+            "optimizer_strategy": self.name,
+            "exact_strategy": self.exact_strategy,
+            "requested": dict(self.requested),
+            "stages": self.stage_dicts(),
+        }
 
 
 class OptimizationService:
@@ -294,24 +386,25 @@ class OptimizationService:
         exact_strategy = cls.funnel_exact_strategy(optimizer_strategy)
         if exact_strategy is None:
             return None
-        return {
-            "kind": "funnel",
-            "optimizer_strategy": str(optimizer_strategy),
-            "exact_strategy": exact_strategy,
-            "requested": {
+        stages = cls.funnel_stage_plan(
+            n_islands,
+            island_pop,
+            evo_steps,
+            sade_gen,
+            exact_strategy=exact_strategy,
+        )
+        funnel = FunnelConfig.from_stage_dicts(
+            str(optimizer_strategy),
+            exact_strategy,
+            {
                 "n_islands": int(n_islands),
                 "island_pop": int(island_pop),
                 "evo_steps": int(evo_steps),
                 "sade_gen": int(sade_gen),
             },
-            "stages": cls.funnel_stage_plan(
-                n_islands,
-                island_pop,
-                evo_steps,
-                sade_gen,
-                exact_strategy=exact_strategy,
-            ),
-        }
+            stages,
+        )
+        return funnel.to_dict()
 
     @staticmethod
     def select_exact_diverse_seeds(problem, genes, count):

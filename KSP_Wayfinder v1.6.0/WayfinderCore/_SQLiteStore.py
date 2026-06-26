@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime, timedelta
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 def _json_dumps(value):
@@ -177,6 +177,7 @@ class SQLiteJobStore:
                 ended_at TEXT,
                 optimizer_topology TEXT,
                 optimizer_seed INTEGER,
+                effective_optimizer_seed INTEGER,
                 requested_n_island INTEGER,
                 actual_n_island INTEGER,
                 island_pop INTEGER,
@@ -185,6 +186,10 @@ class SQLiteJobStore:
                 actual_n_evo_steps INTEGER,
                 adaptive_stop_json TEXT,
                 optimizer_strategy TEXT,
+                funnel_config_json TEXT,
+                funnel_config_hash TEXT,
+                code_revision TEXT,
+                planet_pack_hash TEXT,
                 stop_reason TEXT,
                 runtime_seconds REAL,
                 notes TEXT,
@@ -325,6 +330,7 @@ class SQLiteJobStore:
         self._ensure_column("optimizer_snapshots", "migrations_accepted", "INTEGER")
         self._ensure_column("runs", "optimizer_topology", "TEXT")
         self._ensure_column("runs", "optimizer_seed", "INTEGER")
+        self._ensure_column("runs", "effective_optimizer_seed", "INTEGER")
         self._ensure_column("runs", "requested_n_island", "INTEGER")
         self._ensure_column("runs", "actual_n_island", "INTEGER")
         self._ensure_column("runs", "island_pop", "INTEGER")
@@ -333,6 +339,10 @@ class SQLiteJobStore:
         self._ensure_column("runs", "actual_n_evo_steps", "INTEGER")
         self._ensure_column("runs", "adaptive_stop_json", "TEXT")
         self._ensure_column("runs", "optimizer_strategy", "TEXT")
+        self._ensure_column("runs", "funnel_config_json", "TEXT")
+        self._ensure_column("runs", "funnel_config_hash", "TEXT")
+        self._ensure_column("runs", "code_revision", "TEXT")
+        self._ensure_column("runs", "planet_pack_hash", "TEXT")
         self._ensure_column("runs", "stop_reason", "TEXT")
         self._ensure_column("runs", "runtime_seconds", "REAL")
         self._ensure_column("optimizer_stages", "initialization", "TEXT")
@@ -778,14 +788,24 @@ class SQLiteJobStore:
         versions = versions or {}
         optimizer_metadata = optimizer_metadata or {}
         now = _utc_now()
+        funnel_config = optimizer_metadata.get("funnel_config")
+        funnel_config_json = (
+            _json_dumps(funnel_config) if funnel_config is not None else None
+        )
+        funnel_config_hash = (
+            hashlib.sha256(funnel_config_json.encode("utf-8")).hexdigest()
+            if funnel_config_json is not None else None
+        )
         cur = self.conn.execute(
             """
             INSERT INTO runs(
                 job_id, pykep_version, pygmo_version, wayfinder_version,
                 status, started_at, optimizer_topology, optimizer_seed,
-                requested_n_island, actual_n_island, island_pop, sade_gen,
-                n_evo_steps, adaptive_stop_json, optimizer_strategy
-            ) VALUES (?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                effective_optimizer_seed, requested_n_island, actual_n_island,
+                island_pop, sade_gen, n_evo_steps, adaptive_stop_json,
+                optimizer_strategy, funnel_config_json, funnel_config_hash,
+                code_revision, planet_pack_hash
+            ) VALUES (?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(job_id),
@@ -795,6 +815,7 @@ class SQLiteJobStore:
                 now,
                 _sqlite_text(optimizer_metadata.get("optimizer_topology")),
                 optimizer_metadata.get("optimizer_seed"),
+                optimizer_metadata.get("effective_optimizer_seed"),
                 optimizer_metadata.get("requested_n_island"),
                 optimizer_metadata.get("actual_n_island"),
                 optimizer_metadata.get("island_pop"),
@@ -803,6 +824,10 @@ class SQLiteJobStore:
                 _json_dumps(optimizer_metadata.get("adaptive_stop"))
                 if optimizer_metadata.get("adaptive_stop") else None,
                 _sqlite_text(optimizer_metadata.get("optimizer_strategy")),
+                funnel_config_json,
+                funnel_config_hash,
+                _sqlite_text(optimizer_metadata.get("code_revision")),
+                _sqlite_text(optimizer_metadata.get("planet_pack_hash")),
             ),
         )
         self.conn.commit()
@@ -1332,6 +1357,7 @@ class SQLiteJobStore:
                 j.optimizer_seed,
                 ru.optimizer_topology AS run_optimizer_topology,
                 ru.optimizer_seed AS run_optimizer_seed,
+                ru.effective_optimizer_seed,
                 ru.requested_n_island,
                 ru.actual_n_island,
                 ru.island_pop AS run_island_pop,
@@ -1340,6 +1366,10 @@ class SQLiteJobStore:
                 ru.actual_n_evo_steps,
                 ru.adaptive_stop_json,
                 ru.optimizer_strategy,
+                ru.funnel_config_json,
+                ru.funnel_config_hash,
+                ru.code_revision,
+                ru.planet_pack_hash,
                 ru.stop_reason,
                 ru.runtime_seconds,
                 r.objective_dv,

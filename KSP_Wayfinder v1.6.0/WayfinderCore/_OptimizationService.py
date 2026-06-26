@@ -16,6 +16,22 @@ from _Optimization import alpha_leg_tofs, direct_leg_tofs
 class OptimizationService:
     """Build topologies and report archipelago behavior."""
 
+    FUNNEL_STRATEGIES = {
+        "funnel": "legacy",
+        "funnel_local_exact": "local",
+        "funnel_hybrid_exact": "hybrid",
+        "funnel_phase_elites_nm": "phase_elites_nm",
+        "funnel_phase_elites_equal": "phase_elites_nm_equal",
+        "funnel_scout_archive": "scout_archive_nm",
+        "funnel_scout_archive_32": "scout_archive_nm_32",
+        "funnel_scout_archive_64": "scout_archive_nm_64",
+        "funnel_scout_archive_128": "scout_archive_nm_128",
+    }
+
+    @classmethod
+    def funnel_exact_strategy(cls, optimizer_strategy):
+        return cls.FUNNEL_STRATEGIES.get(optimizer_strategy)
+
     @staticmethod
     def automatic_worker_count(reserve_cores=2):
         """Return a conservative worker count based on the local CPU count."""
@@ -269,6 +285,33 @@ class OptimizationService:
                     "Unknown exact funnel strategy: " + str(exact_strategy)
                 )
         return stages
+
+    @classmethod
+    def funnel_run_config(
+        cls, optimizer_strategy, n_islands, island_pop, evo_steps, sade_gen,
+    ):
+        """Return the complete canonical funnel configuration for one run."""
+        exact_strategy = cls.funnel_exact_strategy(optimizer_strategy)
+        if exact_strategy is None:
+            return None
+        return {
+            "kind": "funnel",
+            "optimizer_strategy": str(optimizer_strategy),
+            "exact_strategy": exact_strategy,
+            "requested": {
+                "n_islands": int(n_islands),
+                "island_pop": int(island_pop),
+                "evo_steps": int(evo_steps),
+                "sade_gen": int(sade_gen),
+            },
+            "stages": cls.funnel_stage_plan(
+                n_islands,
+                island_pop,
+                evo_steps,
+                sade_gen,
+                exact_strategy=exact_strategy,
+            ),
+        }
 
     @staticmethod
     def select_exact_diverse_seeds(problem, genes, count):

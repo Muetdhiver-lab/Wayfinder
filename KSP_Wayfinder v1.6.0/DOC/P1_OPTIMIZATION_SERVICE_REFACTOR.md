@@ -72,6 +72,27 @@ candidats vide sont également couvertes.
 La suite atteint maintenant 57 tests et 9 sous-tests. `_Wayfinder.py` est passé
 d'environ 3 734 à 3 485 lignes au cours des trois tranches.
 
+## Tranche 4
+
+Les métadonnées nécessaires à la reconstruction d'un run historique sont
+désormais persistées au niveau SQL `runs` en schéma v15 :
+
+- `effective_optimizer_seed`, y compris quand le job n'avait pas de seed
+  explicite ;
+- `funnel_config_json`, instantané canonique de la configuration complète du
+  funnel ;
+- `funnel_config_hash`, pour grouper et comparer les runs sans décoder tout le
+  JSON ;
+- `code_revision`, rempli best-effort depuis Git ;
+- `planet_pack_hash`, calculé depuis les constantes orbitales chargées.
+
+`OptimizationService` expose aussi la correspondance canonique entre stratégie
+publique et stratégie exacte de funnel, ainsi qu'un constructeur de config de
+run. Un test dédié vérifie qu'un run historique peut être relancé avec la même
+seed effective et le même hash de configuration.
+
+La suite atteint maintenant 58 tests et 9 sous-tests.
+
 ## Tranche suivante proposée
 
 Ne pas déplacer immédiatement `_run_sqlite_funnel_job`, qui mélange encore

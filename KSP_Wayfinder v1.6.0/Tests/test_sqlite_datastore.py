@@ -4,7 +4,9 @@
 import os
 import sys
 import contextlib
+import hashlib
 import io
+import json
 import shutil
 import sqlite3
 import unittest
@@ -24,6 +26,7 @@ REFERENCE_DB = TESTS_DIR / "wayfinder_reference.sqlite"
 sys.path.insert(0, str(CORE_DIR))
 
 from _SQLiteStore import SQLiteJobStore  # noqa: E402
+from _OptimizationService import OptimizationService  # noqa: E402
 from _Wayfinder import Wayfinder  # noqa: E402
 
 
@@ -139,14 +142,14 @@ class SQLiteDatastoreTests(unittest.TestCase):
                 second.conn.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone()["value"],
-                "14",
+                "15",
             )
         finally:
             first.close()
             second.close()
             db_path.unlink(missing_ok=True)
 
-    def test_schema_13_is_migrated_to_schema_14(self):
+    def test_schema_13_is_migrated_to_schema_15(self):
         db_path = TESTS_DIR / f"wayfinder_sqlite_test_{uuid.uuid4().hex}.sqlite"
         store = SQLiteJobStore(db_path)
         store.close()
@@ -155,6 +158,11 @@ class SQLiteDatastoreTests(unittest.TestCase):
             conn.execute("DROP INDEX idx_jobs_claim")
             for column in ("claimed_at", "claim_expires_at", "worker_id"):
                 conn.execute(f"ALTER TABLE jobs DROP COLUMN {column}")
+            for column in (
+                "effective_optimizer_seed", "funnel_config_json",
+                "funnel_config_hash", "code_revision", "planet_pack_hash",
+            ):
+                conn.execute(f"ALTER TABLE runs DROP COLUMN {column}")
             for column in (
                 "topology_name", "migration_rate", "exact_archive_size",
             ):
@@ -184,6 +192,17 @@ class SQLiteDatastoreTests(unittest.TestCase):
                 {"claimed_at", "claim_expires_at", "worker_id"}
                 <= job_columns
             )
+            run_columns = {
+                row["name"]
+                for row in migrated.conn.execute("PRAGMA table_info(runs)")
+            }
+            self.assertTrue(
+                {
+                    "effective_optimizer_seed", "funnel_config_json",
+                    "funnel_config_hash", "code_revision", "planet_pack_hash",
+                }
+                <= run_columns
+            )
             self.assertTrue(
                 {"topology_name", "migration_rate", "exact_archive_size"}
                 <= stage_columns
@@ -192,7 +211,7 @@ class SQLiteDatastoreTests(unittest.TestCase):
                 migrated.conn.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
                 ).fetchone()["value"],
-                "14",
+                "15",
             )
         finally:
             migrated.close()
@@ -600,17 +619,29 @@ class SQLiteDatastoreTests(unittest.TestCase):
         store = SQLiteJobStore(db_path)
         try:
             job = store.pending_jobs("Vanilla", limit=1, batch_name="run_metadata")[0]
+            funnel_config = OptimizationService.funnel_run_config(
+                "funnel_scout_archive_32",
+                job["n_island"],
+                job["island_pop"],
+                job["n_evo_steps"],
+                job["sade_gen"],
+            )
             run_id = store.start_run(
                 job["job_id"],
                 versions={"wayfinder": "test"},
                 optimizer_metadata={
                     "optimizer_topology": job["optimizer_topology"],
                     "optimizer_seed": job["optimizer_seed"],
+                    "effective_optimizer_seed": 42,
                     "requested_n_island": job["n_island"],
                     "actual_n_island": job["n_island"],
                     "island_pop": job["island_pop"],
                     "sade_gen": job["sade_gen"],
                     "n_evo_steps": job["n_evo_steps"],
+                    "optimizer_strategy": "funnel_scout_archive_32",
+                    "funnel_config": funnel_config,
+                    "code_revision": "test-revision",
+                    "planet_pack_hash": "test-planet-pack",
                 },
             )
             store.finish_run(
@@ -621,16 +652,135 @@ class SQLiteDatastoreTests(unittest.TestCase):
                 """
                 SELECT optimizer_topology, optimizer_seed, requested_n_island,
                        actual_n_island, island_pop, sade_gen, n_evo_steps,
-                       actual_n_evo_steps, stop_reason, runtime_seconds
+                       effective_optimizer_seed, actual_n_evo_steps,
+                       stop_reason, runtime_seconds, optimizer_strategy,
+                       funnel_config_json, funnel_config_hash, code_revision,
+                       planet_pack_hash
                 FROM runs WHERE id = ?
                 """,
                 (run_id,),
             ).fetchone()
             self.assertEqual(row["optimizer_topology"], "ring")
             self.assertEqual(row["optimizer_seed"], 42)
+            self.assertEqual(row["effective_optimizer_seed"], 42)
+            self.assertEqual(row["optimizer_strategy"], "funnel_scout_archive_32")
+            self.assertEqual(json.loads(row["funnel_config_json"]), funnel_config)
+            self.assertEqual(
+                row["funnel_config_hash"],
+                hashlib.sha256(row["funnel_config_json"].encode()).hexdigest(),
+            )
+            self.assertEqual(row["code_revision"], "test-revision")
+            self.assertEqual(row["planet_pack_hash"], "test-planet-pack")
             self.assertEqual(row["runtime_seconds"], 12.5)
             self.assertEqual(row["actual_n_evo_steps"], 7)
             self.assertEqual(row["stop_reason"], "convergence_plateau")
+        finally:
+            store.close()
+            db_path.unlink(missing_ok=True)
+
+    def test_historical_run_replay_preserves_exact_funnel_config_and_seed(self):
+        db_path = TESTS_DIR / f"wayfinder_sqlite_test_{uuid.uuid4().hex}.sqlite"
+        plans = Wayfinder(planet_pack="Vanilla")
+        plans.add_batch_sqlite(
+            db_path=db_path,
+            batch_name="historical_replay",
+            swing_by_bodies=[["Kerbin"], ["Eve"], ["Moho"]],
+            t0_min=0,
+            t0_bin=100,
+            n_t0_bins=1,
+            auto_tof=True,
+            opt_level="debug",
+            opt_injection="vinf",
+            purpose="benchmark",
+            optimizer_topology="ring",
+            optimizer_seed=None,
+        )
+
+        store = SQLiteJobStore(db_path)
+        try:
+            job = store.pending_jobs("Vanilla", limit=1, batch_name="historical_replay")[0]
+            effective_seed = 987654321
+            funnel_config = OptimizationService.funnel_run_config(
+                "funnel_scout_archive_64",
+                job["n_island"],
+                job["island_pop"],
+                job["n_evo_steps"],
+                job["sade_gen"],
+            )
+            first_run_id = store.start_run(
+                job["job_id"],
+                versions={"wayfinder": "test"},
+                optimizer_metadata={
+                    "optimizer_topology": job["optimizer_topology"],
+                    "optimizer_seed": job["optimizer_seed"],
+                    "effective_optimizer_seed": effective_seed,
+                    "requested_n_island": job["n_island"],
+                    "actual_n_island": job["n_island"],
+                    "island_pop": job["island_pop"],
+                    "sade_gen": job["sade_gen"],
+                    "n_evo_steps": job["n_evo_steps"],
+                    "optimizer_strategy": "funnel_scout_archive_64",
+                    "funnel_config": funnel_config,
+                    "code_revision": "test-revision",
+                    "planet_pack_hash": "test-planet-pack",
+                },
+            )
+            first_context = store.run_context(first_run_id)
+            replay_config = json.loads(first_context["funnel_config_json"])
+
+            self.assertEqual(first_context["effective_optimizer_seed"], effective_seed)
+            self.assertEqual(replay_config, funnel_config)
+            self.assertEqual(
+                first_context["funnel_config_hash"],
+                hashlib.sha256(
+                    json.dumps(
+                        replay_config, sort_keys=True, separators=(",", ":")
+                    ).encode()
+                ).hexdigest(),
+            )
+
+            replay_run_id = store.start_run(
+                first_context["job_id"],
+                versions={"wayfinder": "test"},
+                optimizer_metadata={
+                    "optimizer_topology": first_context["run_optimizer_topology"],
+                    "optimizer_seed": first_context["run_optimizer_seed"],
+                    "effective_optimizer_seed": first_context[
+                        "effective_optimizer_seed"
+                    ],
+                    "requested_n_island": first_context["requested_n_island"],
+                    "actual_n_island": first_context["actual_n_island"],
+                    "island_pop": first_context["run_island_pop"],
+                    "sade_gen": first_context["run_sade_gen"],
+                    "n_evo_steps": first_context["run_n_evo_steps"],
+                    "optimizer_strategy": first_context["optimizer_strategy"],
+                    "funnel_config": replay_config,
+                    "code_revision": first_context["code_revision"],
+                    "planet_pack_hash": first_context["planet_pack_hash"],
+                },
+            )
+            replay_context = store.run_context(replay_run_id)
+
+            self.assertEqual(
+                replay_context["effective_optimizer_seed"],
+                first_context["effective_optimizer_seed"],
+            )
+            self.assertEqual(
+                replay_context["funnel_config_hash"],
+                first_context["funnel_config_hash"],
+            )
+            self.assertEqual(
+                json.loads(replay_context["funnel_config_json"]),
+                replay_config,
+            )
+            self.assertEqual(
+                replay_context["planet_pack_hash"],
+                first_context["planet_pack_hash"],
+            )
+            self.assertEqual(
+                replay_context["code_revision"],
+                first_context["code_revision"],
+            )
         finally:
             store.close()
             db_path.unlink(missing_ok=True)

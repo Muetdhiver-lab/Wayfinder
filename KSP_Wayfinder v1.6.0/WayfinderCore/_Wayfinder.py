@@ -5,9 +5,11 @@ Created on Wed May 29 08:02:50 2019
 @author: v.fave
 """
 import copy
+import hashlib
 import json
 import logging
 from pathlib import Path
+import subprocess
 import time
 import pandas as pd
 import pygmo as pg
@@ -318,6 +320,54 @@ class Wayfinder:
                 elite_fraction=0.5,
             ),
         )
+
+    def _planet_pack_hash(self):
+        """Hash the orbital constants used by this Wayfinder instance."""
+        def json_float(value):
+            if value is None:
+                return None
+            return float(value)
+
+        bodies = {}
+        for name, body in sorted(self._fullname_dic.items()):
+            bodies[name] = {
+                "name": getattr(body, "name", name),
+                "mu_self": json_float(getattr(body, "mu_self", None)),
+                "mu_central_body": json_float(
+                    getattr(body, "mu_central_body", None)
+                ),
+                "radius": json_float(getattr(body, "radius", None)),
+                "safe_radius": json_float(getattr(body, "safe_radius", None)),
+                "orbital_elements": [
+                    json_float(value)
+                    for value in getattr(body, "orbital_elements", [])
+                ],
+                "soi_radius": json_float(self.soi_radius(body)),
+            }
+        payload = {
+            "planet_pack": self.planet_pack,
+            "edy_to_kdy": self._Edy2Kdy,
+            "bodies": bodies,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    @staticmethod
+    def _code_revision():
+        """Return the current Git revision when the checkout is available."""
+        try:
+            root = Path(__file__).resolve().parents[2]
+            completed = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return completed.stdout.strip()
+        except Exception:
+            return None
         
         
         
@@ -626,12 +676,26 @@ class Wayfinder:
                 requested_island_pop, island_pop,
             )
         n_evo_steps = int(job["n_evo_steps"])
+        configured_seed = job.get("optimizer_seed")
+        effective_optimizer_seed = (
+            int(configured_seed)
+            if configured_seed is not None
+            else int(np.random.SeedSequence().generate_state(1)[0])
+        )
+        funnel_config = OptimizationService.funnel_run_config(
+            optimizer_strategy,
+            n_island,
+            island_pop,
+            n_evo_steps,
+            sade_gen,
+        )
         sqlite_run_id = store.start_run(
             job["job_id"],
             versions=versions,
             optimizer_metadata={
                 "optimizer_topology": optimizer_topology,
                 "optimizer_seed": optimizer_seed,
+                "effective_optimizer_seed": effective_optimizer_seed,
                 "requested_n_island": requested_n_island,
                 "actual_n_island": n_island,
                 "island_pop": island_pop,
@@ -639,11 +703,13 @@ class Wayfinder:
                 "n_evo_steps": n_evo_steps,
                 "adaptive_stop": adaptive_stop,
                 "optimizer_strategy": optimizer_strategy,
+                "funnel_config": funnel_config,
+                "code_revision": self._code_revision(),
+                "planet_pack_hash": self._planet_pack_hash(),
             },
         )
         try:
-            if optimizer_seed is not None:
-                pg.set_global_rng_seed(int(optimizer_seed))
+            pg.set_global_rng_seed(int(effective_optimizer_seed))
             udp = self._mga_problem_from_sqlite_context(job)
             result = self._run_sqlite_archipelago_job(
                 store,
@@ -659,6 +725,7 @@ class Wayfinder:
                 versions=versions,
                 adaptive_stop=adaptive_stop,
                 optimizer_strategy=optimizer_strategy,
+                effective_optimizer_seed=effective_optimizer_seed,
                 renew_claim=renew_claim,
             )
             runtime_seconds = time.perf_counter() - run_started_at
@@ -696,22 +763,13 @@ class Wayfinder:
         versions,
         adaptive_stop=None,
         optimizer_strategy=DEFAULT_OPTIMIZER_STRATEGY,
+        effective_optimizer_seed=None,
         renew_claim=None,
     ):
         soi_radius_by_name = {
             name: self.soi_radius(body) for name, body in self._fullname_dic.items()
         }
-        funnel_strategies = {
-            "funnel": "legacy",
-            "funnel_local_exact": "local",
-            "funnel_hybrid_exact": "hybrid",
-            "funnel_phase_elites_nm": "phase_elites_nm",
-            "funnel_phase_elites_equal": "phase_elites_nm_equal",
-            "funnel_scout_archive": "scout_archive_nm",
-            "funnel_scout_archive_32": "scout_archive_nm_32",
-            "funnel_scout_archive_64": "scout_archive_nm_64",
-            "funnel_scout_archive_128": "scout_archive_nm_128",
-        }
+        funnel_strategies = OptimizationService.FUNNEL_STRATEGIES
         if optimizer_strategy in funnel_strategies:
             return self._run_sqlite_funnel_job(
                 store, job, udp, sqlite_run_id,
@@ -725,6 +783,7 @@ class Wayfinder:
                 adaptive_stop=adaptive_stop,
                 soi_radius_by_name=soi_radius_by_name,
                 exact_strategy=funnel_strategies[optimizer_strategy],
+                effective_optimizer_seed=effective_optimizer_seed,
                 renew_claim=renew_claim,
             )
         if optimizer_strategy != "flat":
@@ -833,7 +892,8 @@ class Wayfinder:
         self, store, job, udp, sqlite_run_id, sade_gen,
         requested_n_island, n_island, island_pop, n_evo_steps,
         topology, versions, adaptive_stop, soi_radius_by_name,
-        exact_strategy="legacy", renew_claim=None,
+        exact_strategy="legacy", effective_optimizer_seed=None,
+        renew_claim=None,
     ):
         """Run the corrected v1.5 wide/intermediate/exact-ejection funnel."""
         stage_plan = self._funnel_stage_plan(
@@ -846,10 +906,9 @@ class Wayfinder:
         total_steps = 0
         stage_summaries = []
         final_archipelago = None
-        configured_seed = job.get("optimizer_seed")
         base_seed = (
-            int(configured_seed)
-            if configured_seed is not None
+            int(effective_optimizer_seed)
+            if effective_optimizer_seed is not None
             else int(np.random.SeedSequence().generate_state(1)[0])
         )
         local_rng = np.random.default_rng(base_seed)

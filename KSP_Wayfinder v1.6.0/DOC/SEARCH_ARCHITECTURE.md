@@ -85,9 +85,11 @@ available. Seeding replaces one random individual rather than increasing the
 configured population size. The first two stages alternate SADE and simulated
 annealing correctly; the v1.5 prototype accidentally inserted the annealing
 island twice. PyKEP's configured arrival/capture objective remains active at
-all stages. SQLite schema v14 stores per-stage island/population settings,
+all stages. SQLite schema v15 stores per-stage island/population settings,
 initialization, topology name, migration rate, exact archive size, adaptive
-controller, algorithms, best/average fitness, runtime and stop reason.
+controller, algorithms, best/average fitness, runtime and stop reason. It also
+stores run-level replay metadata: effective optimizer seed, canonical funnel
+configuration JSON and hash, best-effort code revision and planet-pack hash.
 
 ## Job ownership
 

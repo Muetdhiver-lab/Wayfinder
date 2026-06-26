@@ -7,6 +7,7 @@ layer still reproduces the stored results.
 """
 
 import json
+import hashlib
 import inspect
 import math
 import shutil
@@ -37,6 +38,7 @@ from _Trajectory import ejection_from_gene  # noqa: E402
 from _Trajectory import fast_ejection_from_gene  # noqa: E402
 from _Trajectory import _safe_acos  # noqa: E402
 from _Optimization import WayfinderFitnessDecorator  # noqa: E402
+from _OptimizationService import OptimizationService  # noqa: E402
 import pykep as pk  # noqa: E402
 import pygmo as pg  # noqa: E402
 from pykep.trajopt import mga_1dsm  # noqa: E402
@@ -193,6 +195,21 @@ class WayfinderRegressionTests(unittest.TestCase):
         with patch("os.cpu_count", return_value=8):
             self.assertEqual(Wayfinder._resolve_island_count(16, auto_workers=False), 16)
 
+    def test_optimizer_facade_delegates_worker_policy_to_service(self):
+        with patch.object(
+            OptimizationService,
+            "resolve_island_count",
+            return_value=3,
+        ) as resolve:
+            result = Wayfinder._resolve_island_count(
+                12, auto_workers=True, reserve_cores=4,
+            )
+
+        self.assertEqual(result, 3)
+        resolve.assert_called_once_with(
+            12, auto_workers=True, reserve_cores=4,
+        )
+
     def test_archipelago_topology_factory_supports_benchmark_topologies(self):
         self.assertIsInstance(Wayfinder._make_archipelago_topology("unconnected", 4), pg.unconnected)
         ring = Wayfinder._make_archipelago_topology("ring", 4)
@@ -275,6 +292,31 @@ class WayfinderRegressionTests(unittest.TestCase):
         self.assertEqual(stages[-1]["sade_gen"], 500)
         self.assertEqual(stages[-1]["initialization"], "random_plus_champion")
         self.assertEqual(stages[-1]["algorithm"], "hybrid")
+
+    def test_optimization_service_preserves_all_funnel_plan_variants(self):
+        expected_digests = {
+            "legacy": "215c26160222c6a49320969561ee9288dc5d73ddcf44cca7080adc426e6a917c",
+            "local": "db7f37234655ae43d6aed232ef0eb8d4ba167becd9655113e74b6f725e9f8f8a",
+            "hybrid": "efe3a5db0cb574cc653554ce01bbd40776072082129151c137b270fe4711c4f4",
+            "phase_elites_nm": "6497b3c946b5546601231c168028e9e9b38be7f59bc62626377c256fba5013b8",
+            "phase_elites_nm_equal": "3ae7b2c97573b7110b6960eb1fe75a738159aea569f68be965912d256bae0236",
+            "scout_archive_nm_32": "8c2276fdb73c63c4cedf9647c617949b650c5e9b8e7387817e9791aa219c45b8",
+            "scout_archive_nm": "528ae24780546649e20ae5f4e53142422bec631b33a9b3ff443def3283bf5c3a",
+            "scout_archive_nm_64": "528ae24780546649e20ae5f4e53142422bec631b33a9b3ff443def3283bf5c3a",
+            "scout_archive_nm_128": "8d321031598d7dc5b0e33bd8f26d6b6053b4294b28feaa2798fc47425595e582",
+        }
+
+        for strategy, expected_digest in expected_digests.items():
+            with self.subTest(strategy=strategy):
+                plan = OptimizationService.funnel_stage_plan(
+                    16, 32, 20, 20, exact_strategy=strategy,
+                )
+                payload = json.dumps(
+                    plan, sort_keys=True, separators=(",", ":"),
+                ).encode()
+                self.assertEqual(
+                    hashlib.sha256(payload).hexdigest(), expected_digest,
+                )
 
     def test_funnel_stage_plan_enforces_sade_minimum_population(self):
         stages = Wayfinder._funnel_stage_plan(1, 1, 1, 1)
@@ -387,6 +429,72 @@ class WayfinderRegressionTests(unittest.TestCase):
 
         self.assertEqual(len(archive), 3)
         self.assertIn([1.0, 1.0], archive)
+
+    def test_exact_diverse_seed_selection_is_preserved_by_service(self):
+        problem = pg.problem(pg.rosenbrock(2))
+        genes = [
+            [1.0, 1.0], [0.0, 0.0], [2.0, 2.0],
+            [-1.0, 1.0], [3.0, -2.0],
+        ]
+
+        selected = OptimizationService.select_exact_diverse_seeds(
+            problem, genes, 3,
+        )
+
+        self.assertEqual(
+            selected,
+            [[1.0, 1.0], [3.0, -2.0], [-1.0, 1.0]],
+        )
+        self.assertEqual(
+            Wayfinder._select_exact_diverse_seeds(problem, genes, 3),
+            selected,
+        )
+
+    def test_exact_diverse_seed_selection_respects_zero_count(self):
+        problem = pg.problem(pg.rosenbrock(2))
+        genes = [[1.0, 1.0], [0.0, 0.0]]
+
+        self.assertEqual(
+            OptimizationService.select_exact_diverse_seeds(problem, genes, 0),
+            [],
+        )
+        self.assertEqual(
+            OptimizationService.select_exact_diverse_seeds(problem, genes, -1),
+            [],
+        )
+        self.assertEqual(
+            OptimizationService.select_exact_diverse_seeds(problem, genes, 1),
+            [[1.0, 1.0]],
+        )
+        self.assertEqual(
+            OptimizationService.select_exact_diverse_seeds(problem, [], 1),
+            [],
+        )
+
+    def test_phase_embedding_receives_planet_context_explicitly(self):
+        class LinearBody:
+            def __init__(self, offset):
+                self.offset = float(offset)
+
+            def eph(self, epoch):
+                value = float(epoch) + self.offset
+                return [value, 1.0, 0.0], [0.0, value, 1.0]
+
+        bodies = {"A": LinearBody(1.0), "B": LinearBody(2.0)}
+        context = {"bodies_json": '["A", "B"]', "tof_encoding": "direct"}
+        problem = pg.problem(pg.rosenbrock(6))
+        gene = [10.0, 0.0, 0.0, 0.0, 0.0, 5.0]
+
+        direct = OptimizationService.encounter_phase_embedding(
+            bodies, context, problem, gene,
+        )
+        plans = Wayfinder(planet_pack="Vanilla")
+        plans._fullname_dic = bodies
+
+        np.testing.assert_allclose(
+            plans._encounter_phase_embedding(context, problem, gene), direct,
+        )
+        self.assertEqual(direct.shape, (13,))
 
     def test_funnel_stage_plan_reduces_wide_archipelago_to_at_most_eight(self):
         stages = Wayfinder._funnel_stage_plan(48, 25, 10, 100)

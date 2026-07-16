@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime, timedelta
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 16
 
 
 def _json_dumps(value):
@@ -148,6 +148,7 @@ class SQLiteJobStore:
                 n_evo_steps INTEGER,
                 optimizer_topology TEXT,
                 optimizer_seed INTEGER,
+                optimizer_strategy TEXT NOT NULL DEFAULT 'funnel',
                 status TEXT NOT NULL,
                 claimed_at TEXT,
                 claim_expires_at TEXT,
@@ -177,6 +178,7 @@ class SQLiteJobStore:
                 ended_at TEXT,
                 optimizer_topology TEXT,
                 optimizer_seed INTEGER,
+                effective_optimizer_seed INTEGER,
                 requested_n_island INTEGER,
                 actual_n_island INTEGER,
                 island_pop INTEGER,
@@ -185,6 +187,10 @@ class SQLiteJobStore:
                 actual_n_evo_steps INTEGER,
                 adaptive_stop_json TEXT,
                 optimizer_strategy TEXT,
+                funnel_config_json TEXT,
+                funnel_config_hash TEXT,
+                code_revision TEXT,
+                planet_pack_hash TEXT,
                 stop_reason TEXT,
                 runtime_seconds REAL,
                 notes TEXT,
@@ -241,6 +247,62 @@ class SQLiteJobStore:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE,
                 UNIQUE(run_id, step, island_index, individual_index, source)
+            );
+
+            CREATE TABLE IF NOT EXISTS sequence_scout_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                planet_pack TEXT NOT NULL,
+                start_body TEXT NOT NULL,
+                target_body TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                direct_reference_json TEXT,
+                status TEXT NOT NULL,
+                raw_candidate_count INTEGER,
+                viable_candidate_count INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(name, planet_pack, config_hash)
+            );
+
+            CREATE TABLE IF NOT EXISTS sequence_scout_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scout_run_id INTEGER NOT NULL,
+                sequence_id INTEGER NOT NULL,
+                bin_start REAL NOT NULL,
+                bin_end REAL NOT NULL,
+                global_rank INTEGER,
+                scout_score REAL NOT NULL,
+                ejection_ratio REAL NOT NULL,
+                lambert_t0 REAL NOT NULL,
+                lambert_tof REAL NOT NULL,
+                leg_tof_bounds_json TEXT NOT NULL,
+                selected_for_l0 INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(scout_run_id, sequence_id, bin_start, bin_end),
+                FOREIGN KEY(scout_run_id) REFERENCES sequence_scout_runs(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(sequence_id) REFERENCES sequences(id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS sequence_scout_jobs (
+                scout_candidate_id INTEGER NOT NULL,
+                job_id INTEGER NOT NULL,
+                workflow_stage TEXT NOT NULL,
+                parent_job_id INTEGER,
+                parent_run_id INTEGER,
+                promotion_rank INTEGER,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(scout_candidate_id, job_id, workflow_stage),
+                FOREIGN KEY(scout_candidate_id)
+                    REFERENCES sequence_scout_candidates(id) ON DELETE CASCADE,
+                FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY(parent_job_id) REFERENCES jobs(id),
+                FOREIGN KEY(parent_run_id) REFERENCES runs(id)
             );
 
             CREATE TABLE IF NOT EXISTS optimizer_stages (
@@ -304,11 +366,17 @@ class SQLiteJobStore:
             CREATE INDEX IF NOT EXISTS idx_optimizer_snapshots_run ON optimizer_snapshots(run_id, step);
             CREATE INDEX IF NOT EXISTS idx_optimizer_population_run ON optimizer_population_points(run_id, step);
             CREATE INDEX IF NOT EXISTS idx_porkchop_samples_run ON porkchop_samples(source_run_id, sampler_name);
+            CREATE INDEX IF NOT EXISTS idx_scout_runs_name ON sequence_scout_runs(planet_pack, name);
+            CREATE INDEX IF NOT EXISTS idx_scout_candidates_bin ON sequence_scout_candidates(scout_run_id, bin_start, scout_score);
+            CREATE INDEX IF NOT EXISTS idx_scout_jobs_stage ON sequence_scout_jobs(workflow_stage, job_id);
             """
         )
         self._ensure_column("batches", "purpose", "TEXT NOT NULL DEFAULT 'production'")
         self._ensure_column("jobs", "optimizer_topology", "TEXT")
         self._ensure_column("jobs", "optimizer_seed", "INTEGER")
+        self._ensure_column(
+            "jobs", "optimizer_strategy", "TEXT NOT NULL DEFAULT 'funnel'"
+        )
         self._ensure_column("jobs", "tof_profile", "TEXT")
         self._ensure_column("jobs", "leg_tof_bounds_json", "TEXT")
         self._ensure_column("jobs", "arrival_mode", "TEXT NOT NULL DEFAULT 'legacy'")
@@ -325,6 +393,7 @@ class SQLiteJobStore:
         self._ensure_column("optimizer_snapshots", "migrations_accepted", "INTEGER")
         self._ensure_column("runs", "optimizer_topology", "TEXT")
         self._ensure_column("runs", "optimizer_seed", "INTEGER")
+        self._ensure_column("runs", "effective_optimizer_seed", "INTEGER")
         self._ensure_column("runs", "requested_n_island", "INTEGER")
         self._ensure_column("runs", "actual_n_island", "INTEGER")
         self._ensure_column("runs", "island_pop", "INTEGER")
@@ -333,6 +402,10 @@ class SQLiteJobStore:
         self._ensure_column("runs", "actual_n_evo_steps", "INTEGER")
         self._ensure_column("runs", "adaptive_stop_json", "TEXT")
         self._ensure_column("runs", "optimizer_strategy", "TEXT")
+        self._ensure_column("runs", "funnel_config_json", "TEXT")
+        self._ensure_column("runs", "funnel_config_hash", "TEXT")
+        self._ensure_column("runs", "code_revision", "TEXT")
+        self._ensure_column("runs", "planet_pack_hash", "TEXT")
         self._ensure_column("runs", "stop_reason", "TEXT")
         self._ensure_column("runs", "runtime_seconds", "REAL")
         self._ensure_column("optimizer_stages", "initialization", "TEXT")
@@ -610,6 +683,268 @@ class SQLiteJobStore:
         self.conn.commit()
         return sequence_id
 
+    def upsert_sequence_scout_run(
+        self, name, planet_pack, start_body, target_body, config,
+        direct_reference=None, status="PREPARED", raw_candidate_count=None,
+        viable_candidate_count=None,
+    ):
+        """Create or refresh one reproducible sequence-scout definition."""
+        config_json = _json_dumps(config)
+        config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
+        now = _utc_now()
+        self.conn.execute(
+            """
+            INSERT INTO sequence_scout_runs(
+                name, planet_pack, start_body, target_body, config_json,
+                config_hash, direct_reference_json, status,
+                raw_candidate_count, viable_candidate_count,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name, planet_pack, config_hash) DO UPDATE SET
+                direct_reference_json = excluded.direct_reference_json,
+                status = excluded.status,
+                raw_candidate_count = excluded.raw_candidate_count,
+                viable_candidate_count = excluded.viable_candidate_count,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(name), str(planet_pack), str(start_body), str(target_body),
+                config_json, config_hash,
+                _json_dumps(direct_reference)
+                if direct_reference is not None else None,
+                str(status), raw_candidate_count, viable_candidate_count,
+                now, now,
+            ),
+        )
+        row = self.conn.execute(
+            """
+            SELECT id FROM sequence_scout_runs
+            WHERE name = ? AND planet_pack = ? AND config_hash = ?
+            """,
+            (str(name), str(planet_pack), config_hash),
+        ).fetchone()
+        self.conn.commit()
+        return int(row["id"])
+
+    def sequence_scout_run(self, scout_run_id=None, name=None, planet_pack=None):
+        if scout_run_id is not None:
+            row = self.conn.execute(
+                "SELECT * FROM sequence_scout_runs WHERE id = ?",
+                (int(scout_run_id),),
+            ).fetchone()
+        else:
+            if name is None or planet_pack is None:
+                raise ValueError("name and planet_pack are required")
+            row = self.conn.execute(
+                """
+                SELECT * FROM sequence_scout_runs
+                WHERE name = ? AND planet_pack = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (str(name), str(planet_pack)),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["config"] = _json_loads(result.pop("config_json"), default={})
+        result["direct_reference"] = _json_loads(
+            result.pop("direct_reference_json"), default=None,
+        )
+        return result
+
+    def upsert_sequence_scout_candidate(
+        self, scout_run_id, sequence_id, bin_start, bin_end, global_rank,
+        scout_score, ejection_ratio, lambert_t0, lambert_tof,
+        leg_tof_bounds, selected_for_l0=True,
+    ):
+        now = _utc_now()
+        self.conn.execute(
+            """
+            INSERT INTO sequence_scout_candidates(
+                scout_run_id, sequence_id, bin_start, bin_end, global_rank,
+                scout_score, ejection_ratio, lambert_t0, lambert_tof,
+                leg_tof_bounds_json, selected_for_l0, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scout_run_id, sequence_id, bin_start, bin_end)
+            DO UPDATE SET
+                global_rank = excluded.global_rank,
+                scout_score = excluded.scout_score,
+                ejection_ratio = excluded.ejection_ratio,
+                lambert_t0 = excluded.lambert_t0,
+                lambert_tof = excluded.lambert_tof,
+                leg_tof_bounds_json = excluded.leg_tof_bounds_json,
+                selected_for_l0 = excluded.selected_for_l0,
+                updated_at = excluded.updated_at
+            """,
+            (
+                int(scout_run_id), int(sequence_id), float(bin_start),
+                float(bin_end), int(global_rank), float(scout_score),
+                float(ejection_ratio), float(lambert_t0), float(lambert_tof),
+                _json_dumps(leg_tof_bounds), int(bool(selected_for_l0)),
+                now, now,
+            ),
+        )
+        row = self.conn.execute(
+            """
+            SELECT id FROM sequence_scout_candidates
+            WHERE scout_run_id = ? AND sequence_id = ?
+              AND bin_start = ? AND bin_end = ?
+            """,
+            (int(scout_run_id), int(sequence_id), float(bin_start), float(bin_end)),
+        ).fetchone()
+        self.conn.commit()
+        return int(row["id"])
+
+    def link_sequence_scout_job(
+        self, scout_candidate_id, job_id, workflow_stage,
+        parent_job_id=None, parent_run_id=None, promotion_rank=None,
+        metadata=None,
+    ):
+        self.conn.execute(
+            """
+            INSERT INTO sequence_scout_jobs(
+                scout_candidate_id, job_id, workflow_stage, parent_job_id,
+                parent_run_id, promotion_rank, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scout_candidate_id, job_id, workflow_stage)
+            DO UPDATE SET
+                parent_job_id = excluded.parent_job_id,
+                parent_run_id = excluded.parent_run_id,
+                promotion_rank = excluded.promotion_rank,
+                metadata_json = excluded.metadata_json
+            """,
+            (
+                int(scout_candidate_id), int(job_id), str(workflow_stage),
+                None if parent_job_id is None else int(parent_job_id),
+                None if parent_run_id is None else int(parent_run_id),
+                None if promotion_rank is None else int(promotion_rank),
+                _json_dumps(metadata) if metadata is not None else None,
+                _utc_now(),
+            ),
+        )
+        self.conn.commit()
+
+    def sequence_scout_l0_results(self, scout_run_id):
+        """Return every completed L0 result linked to a scout candidate."""
+        rows = self.conn.execute(
+            """
+            SELECT
+                c.id AS scout_candidate_id,
+                c.bin_start, c.bin_end, c.global_rank, c.scout_score,
+                c.ejection_ratio, c.lambert_t0, c.lambert_tof,
+                c.leg_tof_bounds_json,
+                s.short_name AS sequence_short_name, s.bodies_json,
+                j.id AS job_id, j.optimizer_seed,
+                ru.id AS run_id, ru.runtime_seconds,
+                r.objective_dv, r.result_t0, r.result_tof
+            FROM sequence_scout_candidates c
+            JOIN sequences s ON s.id = c.sequence_id
+            JOIN sequence_scout_jobs sj
+              ON sj.scout_candidate_id = c.id
+             AND sj.workflow_stage = 'l0'
+            JOIN jobs j ON j.id = sj.job_id
+            JOIN runs ru ON ru.job_id = j.id AND ru.status = 'DONE'
+            JOIN results r ON r.run_id = ru.id
+            WHERE c.scout_run_id = ?
+            ORDER BY c.bin_start, r.objective_dv, s.short_name, ru.id
+            """,
+            (int(scout_run_id),),
+        ).fetchall()
+        result = []
+        seen = set()
+        for row in rows:
+            candidate_id = int(row["scout_candidate_id"])
+            if candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            item = dict(row)
+            item["bodies"] = _json_loads(item.pop("bodies_json"), default=[])
+            item["leg_tof_bounds"] = _json_loads(
+                item.pop("leg_tof_bounds_json"), default=[],
+            )
+            result.append(item)
+        return result
+
+    def promoted_seed_genes(self, job_id):
+        """Load the persisted L0 population associated with a promoted job."""
+        parent = self.conn.execute(
+            """
+            SELECT parent_run_id
+            FROM sequence_scout_jobs
+            WHERE job_id = ? AND workflow_stage = 'funnel'
+              AND parent_run_id IS NOT NULL
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (int(job_id),),
+        ).fetchone()
+        if parent is None:
+            return []
+        parent_run_id = int(parent["parent_run_id"])
+        rows = self.conn.execute(
+            """
+            SELECT gene_json
+            FROM optimizer_population_points
+            WHERE run_id = ? AND source = 'stage_1_final'
+            ORDER BY fitness ASC, island_index ASC, individual_index ASC
+            """,
+            (parent_run_id,),
+        ).fetchall()
+        if rows:
+            return [_json_loads(row["gene_json"], default=[]) for row in rows]
+        champion = self.conn.execute(
+            "SELECT gene_json FROM genes WHERE run_id = ?",
+            (parent_run_id,),
+        ).fetchone()
+        return (
+            [_json_loads(champion["gene_json"], default=[])]
+            if champion is not None else []
+        )
+
+    def sequence_scout_status(self, scout_run_id):
+        counts = self.conn.execute(
+            """
+            SELECT
+                sj.workflow_stage, j.status, COUNT(*) AS count
+            FROM sequence_scout_candidates c
+            JOIN sequence_scout_jobs sj ON sj.scout_candidate_id = c.id
+            JOIN jobs j ON j.id = sj.job_id
+            WHERE c.scout_run_id = ?
+            GROUP BY sj.workflow_stage, j.status
+            """,
+            (int(scout_run_id),),
+        ).fetchall()
+        result = self.sequence_scout_run(scout_run_id=scout_run_id)
+        if result is None:
+            raise ValueError("Unknown scout_run_id: " + str(scout_run_id))
+        result["job_counts"] = {
+            "{}:{}".format(row["workflow_stage"], row["status"]): int(row["count"])
+            for row in counts
+        }
+        job_counts = result["job_counts"]
+        result["stored_status"] = result["status"]
+        l0_active = any(
+            job_counts.get("l0:" + status, 0)
+            for status in ("TODO", "RUNNING")
+        )
+        funnel_active = any(
+            job_counts.get("funnel:" + status, 0)
+            for status in ("TODO", "RUNNING")
+        )
+        has_funnel = any(
+            key.startswith("funnel:") for key in job_counts
+        )
+        if l0_active and has_funnel:
+            result["status"] = "PARTIAL_PROMOTION_RUNNING"
+        elif l0_active:
+            result["status"] = "L0_RUNNING"
+        elif funnel_active:
+            result["status"] = "FUNNEL_RUNNING"
+        elif job_counts.get("funnel:DONE", 0):
+            result["status"] = "COMPLETE"
+        elif job_counts.get("l0:DONE", 0):
+            result["status"] = "L0_READY"
+        return result
+
     def _job_params_from_row(self, planet_pack, seq_short_name, t0_lb, tof_lb, row):
         bodies = list(row["mga_seq_fullname"])
         t0 = list(row["mga_t0"])
@@ -642,6 +977,7 @@ class SQLiteJobStore:
             "lambert_max_revs": int(row.get("mga_lambert_max_revs", 0)),
             "optimizer_topology": row.get("optimizer_topology", "ring"),
             "optimizer_seed": row.get("optimizer_seed", None),
+            "optimizer_strategy": row.get("optimizer_strategy", "funnel"),
         }
 
     def upsert_job(self, params, batch_id=None, status="TODO", versions=None, result=None):
@@ -681,6 +1017,7 @@ class SQLiteJobStore:
             int(params["n_evo_steps"]),
             params.get("optimizer_topology", "ring"),
             params.get("optimizer_seed", None),
+            params.get("optimizer_strategy", "funnel"),
             status,
             job_hash,
             now,
@@ -695,11 +1032,13 @@ class SQLiteJobStore:
                 ejection_altitude, injection_altitude, rp_target, e_target,
                 add_vinf_dep, add_vinf_arr, orbit_insertion, multi_objective,
                 lambert_max_revs, sade_gen, n_island, island_pop, n_evo_steps,
-                optimizer_topology, optimizer_seed, status, param_hash, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                optimizer_topology, optimizer_seed, optimizer_strategy,
+                status, param_hash, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(param_hash) DO UPDATE SET
                 status = CASE
-                    WHEN jobs.status = 'DONE' AND excluded.status = 'TODO' THEN jobs.status
+                    WHEN jobs.status IN ('DONE', 'RUNNING')
+                         AND excluded.status = 'TODO' THEN jobs.status
                     ELSE excluded.status
                 END,
                 updated_at = excluded.updated_at
@@ -738,6 +1077,7 @@ class SQLiteJobStore:
             "n_evo_steps": int(row["job_n_evo_steps"]),
             "optimizer_topology": row.get("optimizer_topology", "ring"),
             "optimizer_seed": row.get("optimizer_seed", None),
+            "optimizer_strategy": row.get("optimizer_strategy", "funnel"),
         })
         result = None
         if row["job_status"] == "DONE":
@@ -778,14 +1118,24 @@ class SQLiteJobStore:
         versions = versions or {}
         optimizer_metadata = optimizer_metadata or {}
         now = _utc_now()
+        funnel_config = optimizer_metadata.get("funnel_config")
+        funnel_config_json = (
+            _json_dumps(funnel_config) if funnel_config is not None else None
+        )
+        funnel_config_hash = (
+            hashlib.sha256(funnel_config_json.encode("utf-8")).hexdigest()
+            if funnel_config_json is not None else None
+        )
         cur = self.conn.execute(
             """
             INSERT INTO runs(
                 job_id, pykep_version, pygmo_version, wayfinder_version,
                 status, started_at, optimizer_topology, optimizer_seed,
-                requested_n_island, actual_n_island, island_pop, sade_gen,
-                n_evo_steps, adaptive_stop_json, optimizer_strategy
-            ) VALUES (?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                effective_optimizer_seed, requested_n_island, actual_n_island,
+                island_pop, sade_gen, n_evo_steps, adaptive_stop_json,
+                optimizer_strategy, funnel_config_json, funnel_config_hash,
+                code_revision, planet_pack_hash
+            ) VALUES (?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(job_id),
@@ -795,6 +1145,7 @@ class SQLiteJobStore:
                 now,
                 _sqlite_text(optimizer_metadata.get("optimizer_topology")),
                 optimizer_metadata.get("optimizer_seed"),
+                optimizer_metadata.get("effective_optimizer_seed"),
                 optimizer_metadata.get("requested_n_island"),
                 optimizer_metadata.get("actual_n_island"),
                 optimizer_metadata.get("island_pop"),
@@ -803,6 +1154,10 @@ class SQLiteJobStore:
                 _json_dumps(optimizer_metadata.get("adaptive_stop"))
                 if optimizer_metadata.get("adaptive_stop") else None,
                 _sqlite_text(optimizer_metadata.get("optimizer_strategy")),
+                funnel_config_json,
+                funnel_config_hash,
+                _sqlite_text(optimizer_metadata.get("code_revision")),
+                _sqlite_text(optimizer_metadata.get("planet_pack_hash")),
             ),
         )
         self.conn.commit()
@@ -1332,6 +1687,7 @@ class SQLiteJobStore:
                 j.optimizer_seed,
                 ru.optimizer_topology AS run_optimizer_topology,
                 ru.optimizer_seed AS run_optimizer_seed,
+                ru.effective_optimizer_seed,
                 ru.requested_n_island,
                 ru.actual_n_island,
                 ru.island_pop AS run_island_pop,
@@ -1340,6 +1696,10 @@ class SQLiteJobStore:
                 ru.actual_n_evo_steps,
                 ru.adaptive_stop_json,
                 ru.optimizer_strategy,
+                ru.funnel_config_json,
+                ru.funnel_config_hash,
+                ru.code_revision,
+                ru.planet_pack_hash,
                 ru.stop_reason,
                 ru.runtime_seconds,
                 r.objective_dv,
@@ -1652,6 +2012,7 @@ class SQLiteJobStore:
                 j.n_evo_steps,
                 j.optimizer_topology,
                 j.optimizer_seed,
+                j.optimizer_strategy,
                 j.status,
                 j.claimed_at,
                 j.claim_expires_at,

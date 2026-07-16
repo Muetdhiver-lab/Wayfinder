@@ -132,6 +132,13 @@ dmypy.json
 Wayfinder-main.zip
 KSP_Wayfinder v1.414/Tests/*.png
 KSP_Wayfinder v1.414/Tests/tmp*/
+KSP_Wayfinder v1.7.0/.heyoka_cache/
+KSP_Wayfinder v1.7.0/.matplotlib/
+KSP_Wayfinder v1.7.0/Tests/*.png
+KSP_Wayfinder v1.7.0/Tests/*.json
+KSP_Wayfinder v1.7.0/Tests/*.sqlite
+!KSP_Wayfinder v1.7.0/Tests/wayfinder_reference.sqlite
+KSP_Wayfinder v1.7.0/*.sqlite
 *.sqlite-wal
 *.sqlite-shm
 *.sqlite-journal

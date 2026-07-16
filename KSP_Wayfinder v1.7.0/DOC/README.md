@@ -1,7 +1,15 @@
- # This is a short use guide/readme for wayfinder v1.6
+ # This is a short use guide/readme for Wayfinder v1.7
 
 Wayfinder is a ksp utility allowing for efficient search of gravity assist sequences using state of the art tools using the awesome pykep/pygmo
 package from ESA ACT. At the moment it's a set of python scripts with no GUI.
+
+Development references:
+
+- [Search and optimizer architecture](SEARCH_ARCHITECTURE.md)
+- [Tisserand sequence scout](TISSERAND_SEQUENCE_SCOUT.md)
+- [Funnel and pressure-cascade benchmark report](FUNNEL_PRESSURE_BENCHMARK_REPORT.md)
+- [P1 optimizer-service refactor notes](P1_OPTIMIZATION_SERVICE_REFACTOR.md)
+- [Scout + L0 SQL benchmark](SEQUENCE_SCOUT_L0_BENCHMARK.md)
 
 ## How does it work :
 
@@ -47,11 +55,12 @@ Here, several options require explanations :
 	+ "high" optimization level usually is able to deal apply with up to 5 bodies in a sequence.
 	+ "wide" can help with exploration when the sequence becomes complex. 
 	+ "ultra" will tax the CPU a lot, but can help when searching with wide windows and complex sequence. It's usually smarter to get a feel of the search space with simpler jobs first before moving to it.
-- **opt_injection** 	: tell the program what type of injection it should work with during the optimization. options are : 
-	+	"none", which means that the optimization will not care about injection cost in DV. 
-	+	"vinf" means that only the velocity at infinity (SOI) will be counted. 
-	+	"elliptical" will set parameters for injection into a highly elliptical orbit with eccentricity of 0.9. 
-	+	"circular" injections means that the optimizer will include the cost of an injection into a circular orbit.
+- **opt_injection / arrival_mode** 	: tell the program what type of arrival objective it should work with during the optimization. Newer direct-search jobs call this `arrival_mode`; older scripts may still use `opt_injection`.
+	+	"flyby" means that arrival v_inf is reported but not penalized. Use this for free encounters, flybys, and continuing trajectories.
+	+	"vinf" means that terminal velocity at infinity is minimized. This is useful only when explicitly desired; it is not the same as a flyby objective.
+	+	"elliptical" will set parameters for insertion into a highly elliptical orbit with eccentricity of 0.9.
+	+	"circular" means that the optimizer will include the cost of an injection into a circular orbit.
+	+	"none" is kept as a compatibility alias for "flyby".
 - **injection alt** 	: target altitude for the orbital injection at destination, if the orbit is circular or elliptical (pe).
 - **ejection alt**  	: parking orbit altitude from which ejection will be done.
 - **db_path** 			: SQLite database path. A single database can store several planet packs, batches, binning strategies and result sets.
@@ -106,8 +115,9 @@ and tricks :
 - **Deep Space Manoeuvres (DSM):** if the first window is not hit perfectly, the DSM values will start to differ from the actual required values. In short, it is important to try to get the encounters as right as possible and not be affraid to tweak the DSM's a bit.
 - **Kerbin-Kerbin assists:** one cannot select kerbin as a target while in kerbin SOI. This makes those assist not trivial to pull off at times. The best way is to set a node at the time of the next encounter and tweak the trajectory using it as a guide.
 - **Nodes as Time Stamps:** a very helpfull trick is to setup manoeuvre nodes as time stamps for the future encounters, as it help finding the setup for the different encounters and also help gauge how far from the prediction one is wandering. 
-- **Beta Plane Angle** is given for each encounter. This is the angle between the plane containing the ship during an encounter and the ecliptic plane. This is massively helpfull to orient the flyby path correctly.
+- **Flyby B-plane / hyperbola inclination** is given for each encounter. This is the pilot-facing flyby-plane target to compare with the in-SOI hyperbolic orbit inclination in KSP. The older PyKEP beta angle is still reported as an internal optimizer parameter, but the hyperbola inclination and periapsis altitude are the practical values to use when manually tuning a flyby.
 - **Pe/Ap of Arcs** are given. This can help a lot to see if the trajectory obtained is correct or not. If the Pe or Ap of a trajectory segment is wrong, then correction is required.
+- **kRPC node injection** can save a lot of setup time by creating the maneuver-node sequence, but Wayfinder does not currently try to auto-correct or fly multi-assist chains. Long KSP patched-conic chains remain a manual leg-by-leg refinement workflow.
 
 
 ## Examples

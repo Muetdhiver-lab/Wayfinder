@@ -102,8 +102,9 @@ class WayfinderFitnessDecorator:
         vinfxy = sqrt(vinfy**2 + vinfx**2)
 
         if self.ejection_model == "vector_3d":
+            r_soi = self.soi_radius_by_name[first_body.name]
             ejection_dv = fast_ejection_from_gene(
-                first_body, dv, self.ejection_altitude
+                first_body, dv, self.ejection_altitude, r_soi
             )["dv"]
             return orig_fitness_function(problem, dv) + ejection_dv - dv[3]
         if self.ejection_model != "approximate":

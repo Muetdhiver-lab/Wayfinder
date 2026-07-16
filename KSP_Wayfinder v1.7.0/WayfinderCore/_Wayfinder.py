@@ -5,10 +5,11 @@ Created on Wed May 29 08:02:50 2019
 @author: v.fave
 """
 import copy
+import hashlib
 import json
 import logging
-import os
 from pathlib import Path
+import subprocess
 import time
 import pandas as pd
 import pygmo as pg
@@ -26,9 +27,16 @@ from _Optimization import alpha_gene_to_direct_gene
 from _Optimization import alpha_leg_tofs
 from _Optimization import direct_leg_tofs
 from _Optimization import direct_tof_bounds_from_leg_tofs
+from _OptimizationService import OptimizationService
+from _SequenceScout import SequenceScout, TisserandScoutConfig
+from _LambertArcFilter import LambertArc1Config, LambertArc1Filter
+from _SequenceScoutWorkflow import (
+    SequenceScoutSQLWorkflow,
+    SequenceScoutWorkflowConfig,
+)
 
 
-WAYFINDER_VERSION = "1.6.0"
+WAYFINDER_VERSION = "1.7.0"
 DEFAULT_OPTIMIZER_STRATEGY = "funnel"
 
 
@@ -224,7 +232,11 @@ class Wayfinder:
                 }
         
         self._opt_insertion_dic = {
-                # "add_vinf_arr", "mga_orbit_insertion", "mga_e_target", "mga_alt_target" 
+                # arrival_mode: [add_vinf_arr, orbit_insertion, e_target]
+                #
+                # "vinf" explicitly minimizes terminal v-infinity. This is
+                # useful when matching/capturing outside the simplified
+                # pericenter-burn model, but it is not a neutral flyby mode.
                 'circular'          : [True, True ,0.0],   #
                 'elliptical'        : [True, True ,0.9],   #
                 'vinf'              : [True ,False,0.0],   #
@@ -234,361 +246,197 @@ class Wayfinder:
 
     @staticmethod
     def automatic_worker_count(reserve_cores=2):
-        """Return a conservative worker count based on the local CPU count."""
-        cpu_count = os.cpu_count() or 1
-        return max(1, int(cpu_count) - int(reserve_cores))
+        """Compatibility facade for :class:`OptimizationService`."""
+        return OptimizationService.automatic_worker_count(reserve_cores)
 
     @classmethod
     def _resolve_island_count(cls, requested_islands, auto_workers=True, reserve_cores=2):
-        requested_islands = int(requested_islands)
-        if not auto_workers:
-            return requested_islands
-        return min(requested_islands, cls.automatic_worker_count(reserve_cores=reserve_cores))
+        return OptimizationService.resolve_island_count(
+            requested_islands,
+            auto_workers=auto_workers,
+            reserve_cores=reserve_cores,
+        )
 
     @staticmethod
     def _make_archipelago_topology(name, n_islands):
-        name = str(name).lower()
-        # The archipelago constructor (or subsequent push_back() calls) adds
-        # one topology vertex per island. Pre-sizing the topology here would
-        # therefore create 2 * n_islands vertices and invalid migration edges.
-        # Keep the argument for API compatibility and basic validation only.
-        if int(n_islands) < 1:
-            raise ValueError("n_islands must be positive")
-        if name == "unconnected":
-            return pg.unconnected()
-        if name == "ring":
-            return pg.ring()
-        if name in ("fully_connected", "fully-connected", "full"):
-            return pg.fully_connected()
-        raise ValueError("Unknown archipelago topology: " + str(name))
+        return OptimizationService.make_archipelago_topology(name, n_islands)
+
+    @staticmethod
+    def _make_split_ring_topology(
+        current_islands=16, alternative_islands=4, bridge_weight=0.25,
+    ):
+        return OptimizationService.make_split_ring_topology(
+            current_islands=current_islands,
+            alternative_islands=alternative_islands,
+            bridge_weight=bridge_weight,
+        )
 
     @staticmethod
     def _population_id_origins(populations):
-        """Map persistent Pygmo IDs to every island containing their copies."""
-        origins = {}
-        for island_index, population in enumerate(populations):
-            for identifier in population.get_ID():
-                origins.setdefault(int(identifier), set()).add(island_index)
-        return origins
+        return OptimizationService.population_id_origins(populations)
 
     @staticmethod
     def _archipelago_telemetry(
         archipelago, populations, previous_id_origins, topology_name,
     ):
-        """Measure topology shape and observed migration for one evolution call."""
-        island_count = len(populations)
-        normalized_topology = str(topology_name).lower()
-        if normalized_topology == "unconnected":
-            topology_vertices = island_count
-            topology_edges = 0
-        else:
-            graph = archipelago.get_topology().to_networkx()
-            topology_vertices = int(graph.number_of_nodes())
-            topology_edges = int(len(graph.edges()))
-        if topology_vertices != island_count:
-            raise RuntimeError(
-                "Archipelago topology has {} vertices for {} islands".format(
-                    topology_vertices, island_count
-                )
-            )
-
-        migrants_db = archipelago.get_migrants_db()
-        migrants_published = sum(len(entry[0]) for entry in migrants_db)
-        migration_islands_active = sum(bool(len(entry[0])) for entry in migrants_db)
-        migrations_accepted = sum(
-            1
-            for island_index, population in enumerate(populations)
-            for identifier in population.get_ID()
-            if int(identifier) in previous_id_origins
-            and island_index not in previous_id_origins[int(identifier)]
+        return OptimizationService.archipelago_telemetry(
+            archipelago,
+            populations,
+            previous_id_origins,
+            topology_name,
         )
-        return {
-            "island_count": island_count,
-            "topology_vertices": topology_vertices,
-            "topology_edges": topology_edges,
-            "migrants_published": int(migrants_published),
-            "migration_islands_active": int(migration_islands_active),
-            # This is an observable lower bound: an ID that migrates multiple
-            # hops within one async evolve call is counted at its final island.
-            "migrations_accepted": int(migrations_accepted),
-        }
 
     @staticmethod
     def _balanced_annealing_schedule(problem, population_size, sade_gen):
-        """Match simulated-annealing evaluations to one SADE evolve call."""
-        dimension = int(problem.get_nx())
-        target = max(1, int(population_size) * int(sade_gen))
-        n_temperature = 2 if target >= 2 * dimension else 1
-        n_range = 2 if target >= 2 * n_temperature * dimension else 1
-        bin_size = max(
-            1, int(round(target / (n_temperature * n_range * dimension)))
+        return OptimizationService.balanced_annealing_schedule(
+            problem, population_size, sade_gen,
         )
-        return {
-            "n_T_adj": n_temperature,
-            "n_range_adj": n_range,
-            "bin_size": bin_size,
-            "target_evaluations": target,
-            "nominal_evaluations": (
-                n_temperature * n_range * bin_size * dimension
-            ),
-        }
 
     @staticmethod
     def _funnel_stage_plan(
         n_islands, island_pop, evo_steps, sade_gen, exact_strategy="legacy",
     ):
-        """Return a strictly narrowing three-stage optimizer plan."""
-        n_stage_1 = max(1, int(n_islands))
-        n_stage_2 = max(1, n_stage_1 // 2) if n_stage_1 > 1 else 1
-        n_stage_3 = min(8, max(1, n_stage_2 // 2)) if n_stage_2 > 1 else 1
-        island_pop = max(7, int(island_pop))
-        focused_pop = max(7, min(island_pop, 14))
-        stages = [
-            {
-                "name": "wide",
-                "n_island": n_stage_1,
-                "island_pop": island_pop,
-                "evo_steps": int(evo_steps),
-                "sade_gen": int(sade_gen),
-                "ejection_model": "approximate",
-                "initialization": "random_plus_champion",
-                "algorithm": "hybrid",
-                "annealing": {"Ts": 3000.0, "Tf": 10.0},
-            },
-            {
-                "name": "intermediate",
-                "n_island": n_stage_2,
-                "island_pop": focused_pop,
-                "evo_steps": int(evo_steps) * 2,
-                "sade_gen": int(sade_gen),
-                "ejection_model": "approximate",
-                "initialization": "random_plus_champion",
-                "algorithm": "hybrid",
-                "annealing": {"Ts": 1000.0, "Tf": 1.0},
-            },
-            {
-                "name": "exact_ejection",
-                "n_island": n_stage_3,
-                "island_pop": focused_pop,
-                "evo_steps": 5,
-                "sade_gen": 500,
-                "ejection_model": "vector_3d",
-                "initialization": "random_plus_champion",
-                "sigma_fraction": 0.04,
-                "algorithm": "hybrid",
-                "annealing": {"Ts": 200.0, "Tf": 0.1},
-            },
-        ]
-        if exact_strategy in ("local", "hybrid"):
-            stages[-1].update({
-                "evo_steps": 10,
-                "sade_gen": 50,
-                "initialization": (
-                    "local" if exact_strategy == "local" else "local_global"
-                ),
-                "algorithm": "sade",
-                "adaptive_stop": {
-                    "min_steps": 2,
-                    "window": 2,
-                    "patience": 2,
-                    "best_relative_tolerance": 0.002,
-                    "average_relative_tolerance": 0.01,
-                },
-            })
-        elif exact_strategy != "legacy":
-            if exact_strategy in ("phase_elites_nm", "phase_elites_nm_equal"):
-                stages[1].update({
-                    "initialization": "phase_elites_mixed",
-                    "elite_fraction": 0.35,
-                })
-                if exact_strategy == "phase_elites_nm_equal":
-                    stages[1]["evo_steps"] = stages[0]["evo_steps"]
-                stages[2].update({
-                    "n_island": min(8, n_stage_2),
-                    "evo_steps": 5,
-                    "sade_gen": 100,
-                    "algorithm": "sade_nlopt",
-                })
-            elif exact_strategy.startswith("scout_archive_nm"):
-                scout_island_options = {
-                    "scout_archive_nm_32": 32,
-                    "scout_archive_nm": 64,
-                    "scout_archive_nm_64": 64,
-                    "scout_archive_nm_128": 128,
-                }
-                if exact_strategy not in scout_island_options:
-                    raise ValueError(
-                        "Unknown scout/archive strategy: " + str(exact_strategy)
-                    )
-                scout_islands = scout_island_options[exact_strategy]
-                scout_population = 8
-                scout_steps = 5
-                # Hold the L0 evaluation budget constant while varying width.
-                # 32/64/128 islands therefore receive 100/50/25 generations.
-                scout_generations = max(
-                    1, int(round(int(sade_gen) * 64 / scout_islands))
-                )
-                wide_step_cost = max(
-                    1, n_stage_1 * island_pop * int(sade_gen)
-                )
-                scout_step_cost = (
-                    scout_islands * scout_population * scout_generations
-                )
-                wide_steps_replaced = int(np.ceil(
-                    scout_step_cost * scout_steps / wide_step_cost
-                ))
-                stages[0].update({
-                    "evo_steps": max(5, int(evo_steps) - wide_steps_replaced),
-                    "initialization": "scout_diverse",
-                    "archive_exact": True,
-                    "archive_interval": 5,
-                    "archive_size": 32,
-                })
-                stages[1].update({
-                    "initialization": "phase_elites_mixed",
-                    "elite_fraction": 0.35,
-                    "archive_exact": True,
-                    "archive_interval": 5,
-                    "archive_size": 32,
-                })
-                stages[2].update({
-                    "n_island": min(8, n_stage_2),
-                    "evo_steps": 10,
-                    "sade_gen": 100,
-                    "algorithm": "sade_nlopt",
-                    "use_exact_archive": True,
-                    "adaptive_stop": {
-                        "min_steps": 5,
-                        "window": 2,
-                        "patience": 2,
-                        "best_relative_tolerance": 0.001,
-                        "average_relative_tolerance": 0.005,
-                        "require_average_plateau": False,
-                    },
-                })
-                stages.insert(0, {
-                    "name": "scout_unconnected",
-                    "n_island": scout_islands,
-                    "island_pop": scout_population,
-                    "evo_steps": scout_steps,
-                    "sade_gen": scout_generations,
-                    "ejection_model": "approximate",
-                    "initialization": "random",
-                    "algorithm": "sade",
-                    "topology": "unconnected",
-                    "migration_rate": 0,
-                })
-            else:
-                raise ValueError(
-                    "Unknown exact funnel strategy: " + str(exact_strategy)
-                )
-        return stages
-
+        return OptimizationService.funnel_stage_plan(
+            n_islands, island_pop, evo_steps, sade_gen,
+            exact_strategy=exact_strategy,
+        )
     def _encounter_phase_embedding(self, context, problem, gene):
-        """Embed a candidate in physical encounter phase space."""
-        bodies = json.loads(context["bodies_json"])
-        n_legs = len(bodies) - 1
-        if context.get("tof_encoding", "direct") == "alpha":
-            leg_tofs = alpha_leg_tofs(gene, n_legs)
-        else:
-            leg_tofs = direct_leg_tofs(gene, n_legs)
-        encounter_epochs = [float(gene[0])]
-        for leg_tof in leg_tofs:
-            encounter_epochs.append(encounter_epochs[-1] + float(leg_tof))
+        return OptimizationService.encounter_phase_embedding(
+            self._fullname_dic, context, problem, gene,
+        )
 
-        features = []
-        for body_name, epoch in zip(bodies, encounter_epochs):
-            position, velocity = self._fullname_dic[body_name].eph(epoch)
-            position = np.asarray(position, dtype=float)
-            velocity = np.asarray(velocity, dtype=float)
-            features.extend(position / max(np.linalg.norm(position), 1e-12))
-            features.extend(velocity / max(np.linalg.norm(velocity), 1e-12))
-
-        if context.get("tof_encoding", "direct") == "direct":
-            lower, upper = problem.get_bounds()
-            for leg_index, leg_tof in enumerate(leg_tofs):
-                gene_index = 5 + 4 * leg_index
-                span = max(float(upper[gene_index] - lower[gene_index]), 1e-12)
-                features.append((float(leg_tof) - lower[gene_index]) / span)
-        else:
-            total_tof = max(float(sum(leg_tofs)), 1e-12)
-            features.extend(float(leg_tof) / total_tof for leg_tof in leg_tofs)
-        return np.asarray(features, dtype=float)
+    def _handoff_diversity_embedding(self, context, problem, gene):
+        return OptimizationService.handoff_diversity_embedding(
+            self._fullname_dic, context, problem, gene,
+        )
 
     def _select_phase_diverse_elites(
         self, context, problem, genes, count, elite_fraction=0.35,
+        selection_policy="phase_farthest",
+        barrier_relative_tolerance=0.0, valley_slot_fraction=1.0,
     ):
-        """Keep good candidates while maximizing encounter-phase separation."""
-        candidates = sorted(
-            ((float(problem.fitness(gene)[0]), list(gene)) for gene in genes),
-            key=lambda item: item[0],
+        if selection_policy in ("pareto_l0", "pareto_all"):
+            return OptimizationService.select_pareto_diverse_elites(
+                problem,
+                genes,
+                count,
+                embedding_for_gene=lambda gene: self._handoff_diversity_embedding(
+                    context, problem, gene,
+                ),
+                elite_fraction=elite_fraction,
+            )
+        if selection_policy == "basin_l0":
+            return OptimizationService.select_basin_allocated_elites(
+                problem,
+                genes,
+                count,
+                embedding_for_gene=lambda gene: self._encounter_phase_embedding(
+                    context, problem, gene,
+                ),
+                elite_fraction=elite_fraction,
+            )
+        if selection_policy in (
+            "hill_valley_l0", "hill_valley_p2_l0", "hill_valley_mr_l0",
+            "hill_valley_mr32_l0",
+        ):
+            bodies = json.loads(context["bodies_json"])
+            periodic_indices = [
+                6 + 4 * flyby_index
+                for flyby_index in range(max(0, len(bodies) - 2))
+            ]
+            return OptimizationService.select_hill_valley_elites(
+                problem,
+                genes,
+                count,
+                periodic_indices=periodic_indices,
+                elite_fraction=elite_fraction,
+                barrier_relative_tolerance=barrier_relative_tolerance,
+                valley_slot_fraction=valley_slot_fraction,
+            )
+        if selection_policy != "phase_farthest":
+            raise ValueError("Unknown handoff selection policy: " + str(
+                selection_policy
+            ))
+        return OptimizationService.select_phase_diverse_elites(
+            problem,
+            genes,
+            count,
+            embedding_for_gene=lambda gene: self._encounter_phase_embedding(
+                context, problem, gene,
+            ),
+            elite_fraction=elite_fraction,
         )
-        count = min(int(count), len(candidates))
-        if not count:
-            return []
-        pool_size = max(count, int(np.ceil(len(candidates) * elite_fraction)))
-        pool = candidates[:min(len(candidates), pool_size)]
-        embeddings = np.asarray([
-            self._encounter_phase_embedding(context, problem, gene)
-            for _, gene in pool
-        ])
-        selected_indices = [0]
-        min_distances = np.sum((embeddings - embeddings[0]) ** 2, axis=1)
-        min_distances[0] = -1.0
-        while len(selected_indices) < count:
-            index = int(np.argmax(min_distances))
-            selected_indices.append(index)
-            distance = np.sum((embeddings - embeddings[index]) ** 2, axis=1)
-            min_distances = np.minimum(min_distances, distance)
-            min_distances[selected_indices] = -1.0
-        return [pool[index][1] for index in selected_indices]
 
     @staticmethod
     def _select_exact_diverse_seeds(problem, genes, count):
-        """Select exact-fitness seeds while retaining basin diversity."""
-        scored = sorted(
-            ((float(problem.fitness(gene)[0]), list(gene)) for gene in genes),
-            key=lambda item: item[0],
+        return OptimizationService.select_exact_diverse_seeds(
+            problem, genes, count,
         )
-        count = min(int(count), len(scored))
-        if count <= 1:
-            return [scored[0][1]] if scored else []
-        candidate_pool = scored[:max(count, min(len(scored), count * 8))]
-        lower, upper = problem.get_bounds()
-        span = np.maximum(np.asarray(upper) - np.asarray(lower), 1e-12)
-        selected = [candidate_pool.pop(0)]
-        while len(selected) < count and candidate_pool:
-            selected_genes = [np.asarray(item[1]) for item in selected]
-            next_index = max(
-                range(len(candidate_pool)),
-                key=lambda index: min(
-                    np.linalg.norm(
-                        (np.asarray(candidate_pool[index][1]) - gene) / span
-                    )
-                    for gene in selected_genes
-                ),
-            )
-            selected.append(candidate_pool.pop(next_index))
-        return [item[1] for item in selected]
 
     def _update_exact_phase_archive(
         self, context, exact_problem, archive_genes, candidate_genes,
         max_size=32,
     ):
-        """Retain exact-good candidates while preserving encounter diversity."""
-        unique = {}
-        for gene in list(archive_genes) + list(candidate_genes):
-            normalized = tuple(float(value) for value in gene)
-            unique[normalized] = list(gene)
-        if not unique:
-            return []
-        return self._select_phase_diverse_elites(
-            context,
-            exact_problem,
-            list(unique.values()),
-            min(int(max_size), len(unique)),
-            elite_fraction=0.5,
+        return OptimizationService.update_exact_phase_archive(
+            archive_genes,
+            candidate_genes,
+            max_size,
+            select_elites=lambda genes, count: self._select_phase_diverse_elites(
+                context,
+                exact_problem,
+                genes,
+                count,
+                elite_fraction=0.5,
+            ),
         )
+
+    def _planet_pack_hash(self):
+        """Hash the orbital constants used by this Wayfinder instance."""
+        def json_float(value):
+            if value is None:
+                return None
+            return float(value)
+
+        bodies = {}
+        for name, body in sorted(self._fullname_dic.items()):
+            bodies[name] = {
+                "name": getattr(body, "name", name),
+                "mu_self": json_float(getattr(body, "mu_self", None)),
+                "mu_central_body": json_float(
+                    getattr(body, "mu_central_body", None)
+                ),
+                "radius": json_float(getattr(body, "radius", None)),
+                "safe_radius": json_float(getattr(body, "safe_radius", None)),
+                "orbital_elements": [
+                    json_float(value)
+                    for value in getattr(body, "orbital_elements", [])
+                ],
+                "soi_radius": json_float(self.soi_radius(body)),
+            }
+        payload = {
+            "planet_pack": self.planet_pack,
+            "edy_to_kdy": self._Edy2Kdy,
+            "bodies": bodies,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    @staticmethod
+    def _code_revision():
+        """Return the current Git revision when the checkout is available."""
+        try:
+            root = Path(__file__).resolve().parents[2]
+            completed = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return completed.stdout.strip()
+        except Exception:
+            return None
         
         
         
@@ -656,6 +504,9 @@ class Wayfinder:
 
         if batch_name == "default":
             batch_name = self._datastore_name
+        arrival_mode, add_vinf_arr, orbit_insertion, e_target = (
+            self._resolve_arrival_mode(opt_injection)
+        )
 
         T0s  = range(t0_min,t0_min+n_t0_bins*t0_bin,t0_bin)
         ToFs = range(tof_min,tof_min+n_tof_bins*tof_bin,tof_bin)
@@ -689,14 +540,15 @@ class Wayfinder:
                         "vinf": [0.8, 1.8],
                         "tof_encoding": "alpha",
                         "opt_level": opt_level,
-                        "opt_injection": opt_injection,
+                        "opt_injection": arrival_mode,
+                        "arrival_mode": arrival_mode,
                         "ejection_altitude": float(ejection_altitude),
                         "injection_altitude": float(injection_altitude),
                         "rp_target": self.rp_target_ward(target, injection_altitude),
-                        "e_target": self._opt_insertion_dic[opt_injection][2],
+                        "e_target": e_target,
                         "add_vinf_dep": True,
-                        "add_vinf_arr": self._opt_insertion_dic[opt_injection][0],
-                        "orbit_insertion": self._opt_insertion_dic[opt_injection][1],
+                        "add_vinf_arr": add_vinf_arr,
+                        "orbit_insertion": orbit_insertion,
                         "multi_objective": False,
                         "lambert_max_revs": int(lambert_max_revs),
                         "sade_gen": self._opt_levels_dic[opt_level][0],
@@ -722,7 +574,8 @@ class Wayfinder:
                     "n_tof_bins": n_tof_bins,
                     "auto_tof": auto_tof,
                     "opt_level": opt_level,
-                    "opt_injection": opt_injection,
+                    "opt_injection": arrival_mode,
+                    "arrival_mode": arrival_mode,
                     "injection_altitude": injection_altitude,
                     "ejection_altitude": ejection_altitude,
                     "lambert_max_revs": lambert_max_revs,
@@ -737,26 +590,66 @@ class Wayfinder:
             store.close()
         return batch_id
 
+    def _resolve_arrival_mode(self, arrival_mode):
+        """Return the canonical arrival mode and pykep objective flags.
+
+        ``opt_injection`` is kept as a legacy name in the old batch API. New
+        code should use ``arrival_mode`` and choose one of:
+
+        - ``vinf``: minimize terminal v-infinity.
+        - ``circular``: capture into a circular orbit at target Pe.
+        - ``elliptical``: capture into a high-eccentricity orbit at target Pe.
+        - ``flyby``: do not penalize terminal v-infinity.
+
+        ``none`` is accepted as a backwards-compatible alias for ``flyby``.
+        """
+        aliases = {"none": "flyby"}
+        canonical = aliases.get(str(arrival_mode), str(arrival_mode))
+        if canonical not in self._opt_insertion_dic:
+            raise ValueError("Unknown arrival mode: " + str(arrival_mode))
+        add_vinf_arr, orbit_insertion, e_target = self._opt_insertion_dic[canonical]
+        return canonical, bool(add_vinf_arr), bool(orbit_insertion), float(e_target)
+
     def add_direct_t0_batch_sqlite(
         self, swing_by_bodies, db_path, batch_name="default",
         t0_min=0, t0_bin=100, n_t0_bins=10, tof_profile="relaxed",
-        opt_level="debug", arrival_mode="vinf", injection_altitude=100000,
+        opt_level="debug", arrival_mode="flyby", injection_altitude=100000,
         ejection_altitude=100000, purpose="production",
         optimizer_topology="ring", optimizer_seed=None,
+        leg_tof_bounds_override=None,
     ):
         """Create direct MGA-1DSM jobs binned only along the launch epoch."""
         from _SQLiteStore import SQLiteJobStore
 
-        if arrival_mode not in self._opt_insertion_dic:
-            raise ValueError("Unknown arrival mode: " + str(arrival_mode))
+        arrival_mode, add_vinf_arr, orbit_insertion, e_target = (
+            self._resolve_arrival_mode(arrival_mode)
+        )
         if batch_name == "default":
             batch_name = self._datastore_name
         sequences = self.generateSequences(swing_by_bodies)
         short_sequences = self.generateShortSequences(swing_by_bodies)
-        add_vinf_arr, orbit_insertion, e_target = self._opt_insertion_dic[arrival_mode]
         jobs = []
         for short_name, sequence in zip(short_sequences, sequences):
             estimate = self.estimate_direct_tof_bounds(sequence, profile=tof_profile)
+            direct_bounds = estimate["direct_bounds_days"]
+            profile_name = estimate["profile"]
+            if leg_tof_bounds_override is not None:
+                direct_bounds = [
+                    [float(low), float(high)]
+                    for low, high in leg_tof_bounds_override
+                ]
+                if len(direct_bounds) != len(sequence) - 1:
+                    raise ValueError(
+                        "leg_tof_bounds_override must contain one [low, high] "
+                        "pair per leg"
+                    )
+                for low, high in direct_bounds:
+                    if low < 0 or high <= low:
+                        raise ValueError(
+                            "Invalid direct leg TOF override bounds: "
+                            + str(direct_bounds)
+                        )
+                profile_name = str(tof_profile) + "_custom_bounds"
             target = self._fullname_dic[sequence[-1]]
             for bin_index in range(int(n_t0_bins)):
                 lower_t0 = float(t0_min + bin_index * t0_bin)
@@ -766,12 +659,12 @@ class Wayfinder:
                     "sequence_short_name": short_name,
                     "t0_min": lower_t0,
                     "t0_max": lower_t0 + float(t0_bin),
-                    "tof_min": float(estimate["total_lower_days"]),
-                    "tof_max": float(estimate["total_upper_days"]),
+                    "tof_min": float(sum(low for low, _ in direct_bounds)),
+                    "tof_max": float(sum(high for _, high in direct_bounds)),
                     "vinf": [0.8, 1.8],
                     "tof_encoding": "direct",
-                    "tof_profile": estimate["profile"],
-                    "leg_tof_bounds": estimate["direct_bounds_days"],
+                    "tof_profile": profile_name,
+                    "leg_tof_bounds": direct_bounds,
                     "opt_level": opt_level,
                     "opt_injection": arrival_mode,
                     "arrival_mode": arrival_mode,
@@ -802,6 +695,7 @@ class Wayfinder:
                     "tof_profile": tof_profile, "arrival_mode": arrival_mode,
                     "opt_level": opt_level, "optimizer_topology": optimizer_topology,
                     "optimizer_seed": optimizer_seed,
+                    "leg_tof_bounds_override": leg_tof_bounds_override,
                 },
                 purpose=purpose,
             )
@@ -864,10 +758,17 @@ class Wayfinder:
         adaptive_stop=None,
         optimizer_strategy=DEFAULT_OPTIMIZER_STRATEGY,
         claim_lease_seconds=86400,
+        initial_seed_genes=None,
     ):
         run_started_at = time.perf_counter()
         worker_id = job["worker_id"]
         claimed_at = job["claimed_at"]
+        if optimizer_strategy is None:
+            optimizer_strategy = (
+                job.get("optimizer_strategy") or DEFAULT_OPTIMIZER_STRATEGY
+            )
+        if initial_seed_genes is None:
+            initial_seed_genes = store.promoted_seed_genes(job["job_id"])
 
         def renew_claim():
             if not store.renew_job_claim(
@@ -897,12 +798,26 @@ class Wayfinder:
                 requested_island_pop, island_pop,
             )
         n_evo_steps = int(job["n_evo_steps"])
+        configured_seed = job.get("optimizer_seed")
+        effective_optimizer_seed = (
+            int(configured_seed)
+            if configured_seed is not None
+            else int(np.random.SeedSequence().generate_state(1)[0])
+        )
+        funnel_config = OptimizationService.funnel_run_config(
+            optimizer_strategy,
+            n_island,
+            island_pop,
+            n_evo_steps,
+            sade_gen,
+        )
         sqlite_run_id = store.start_run(
             job["job_id"],
             versions=versions,
             optimizer_metadata={
                 "optimizer_topology": optimizer_topology,
                 "optimizer_seed": optimizer_seed,
+                "effective_optimizer_seed": effective_optimizer_seed,
                 "requested_n_island": requested_n_island,
                 "actual_n_island": n_island,
                 "island_pop": island_pop,
@@ -910,11 +825,13 @@ class Wayfinder:
                 "n_evo_steps": n_evo_steps,
                 "adaptive_stop": adaptive_stop,
                 "optimizer_strategy": optimizer_strategy,
+                "funnel_config": funnel_config,
+                "code_revision": self._code_revision(),
+                "planet_pack_hash": self._planet_pack_hash(),
             },
         )
         try:
-            if optimizer_seed is not None:
-                pg.set_global_rng_seed(int(optimizer_seed))
+            pg.set_global_rng_seed(int(effective_optimizer_seed))
             udp = self._mga_problem_from_sqlite_context(job)
             result = self._run_sqlite_archipelago_job(
                 store,
@@ -930,6 +847,8 @@ class Wayfinder:
                 versions=versions,
                 adaptive_stop=adaptive_stop,
                 optimizer_strategy=optimizer_strategy,
+                effective_optimizer_seed=effective_optimizer_seed,
+                initial_seed_genes=initial_seed_genes,
                 renew_claim=renew_claim,
             )
             runtime_seconds = time.perf_counter() - run_started_at
@@ -967,23 +886,20 @@ class Wayfinder:
         versions,
         adaptive_stop=None,
         optimizer_strategy=DEFAULT_OPTIMIZER_STRATEGY,
+        effective_optimizer_seed=None,
+        initial_seed_genes=None,
         renew_claim=None,
     ):
         soi_radius_by_name = {
             name: self.soi_radius(body) for name, body in self._fullname_dic.items()
         }
-        funnel_strategies = {
-            "funnel": "legacy",
-            "funnel_local_exact": "local",
-            "funnel_hybrid_exact": "hybrid",
-            "funnel_phase_elites_nm": "phase_elites_nm",
-            "funnel_phase_elites_equal": "phase_elites_nm_equal",
-            "funnel_scout_archive": "scout_archive_nm",
-            "funnel_scout_archive_32": "scout_archive_nm_32",
-            "funnel_scout_archive_64": "scout_archive_nm_64",
-            "funnel_scout_archive_128": "scout_archive_nm_128",
-        }
-        if optimizer_strategy in funnel_strategies:
+        exact_strategy = OptimizationService.funnel_exact_strategy(
+            optimizer_strategy,
+        )
+        if exact_strategy is not None:
+            funnel_config = OptimizationService.funnel_run_config(
+                optimizer_strategy, n_island, island_pop, n_evo_steps, sade_gen,
+            )
             return self._run_sqlite_funnel_job(
                 store, job, udp, sqlite_run_id,
                 sade_gen=sade_gen,
@@ -995,7 +911,16 @@ class Wayfinder:
                 versions=versions,
                 adaptive_stop=adaptive_stop,
                 soi_radius_by_name=soi_radius_by_name,
-                exact_strategy=funnel_strategies[optimizer_strategy],
+                exact_strategy=exact_strategy,
+                requested_optimizer_strategy=optimizer_strategy,
+                effective_optimizer_seed=effective_optimizer_seed,
+                initial_seed_genes=initial_seed_genes,
+                pressure_cascade=OptimizationService.funnel_pressure_cascade_config(
+                    optimizer_strategy
+                ),
+                stage_plan_override=(
+                    funnel_config["stages"] if funnel_config is not None else None
+                ),
                 renew_claim=renew_claim,
             )
         if optimizer_strategy != "flat":
@@ -1104,23 +1029,42 @@ class Wayfinder:
         self, store, job, udp, sqlite_run_id, sade_gen,
         requested_n_island, n_island, island_pop, n_evo_steps,
         topology, versions, adaptive_stop, soi_radius_by_name,
-        exact_strategy="legacy", renew_claim=None,
+        exact_strategy="legacy", requested_optimizer_strategy=None,
+        effective_optimizer_seed=None,
+        initial_seed_genes=None,
+        pressure_cascade=None,
+        branch_label="baseline",
+        stage_index_offset=0,
+        step_offset=0,
+        stage_plan_override=None,
+        stage_seed_offset=0,
+        renew_claim=None,
     ):
         """Run the corrected v1.5 wide/intermediate/exact-ejection funnel."""
-        stage_plan = self._funnel_stage_plan(
-            n_island, island_pop, n_evo_steps, sade_gen,
-            exact_strategy=exact_strategy,
+        stage_plan = (
+            [copy.deepcopy(stage) for stage in stage_plan_override]
+            if stage_plan_override is not None
+            else self._funnel_stage_plan(
+                n_island, island_pop, n_evo_steps, sade_gen,
+                exact_strategy=exact_strategy,
+            )
         )
-        seed_genes = None
+        if not stage_plan:
+            raise ValueError("A funnel branch requires at least one stage")
+        seed_genes = (
+            [list(map(float, gene)) for gene in initial_seed_genes]
+            if initial_seed_genes else None
+        )
         exact_archive_genes = []
-        global_step = 0
+        global_step = int(step_offset)
         total_steps = 0
         stage_summaries = []
         final_archipelago = None
-        configured_seed = job.get("optimizer_seed")
+        pressure_observation = None
+        branch_label = str(branch_label)
         base_seed = (
-            int(configured_seed)
-            if configured_seed is not None
+            int(effective_optimizer_seed)
+            if effective_optimizer_seed is not None
             else int(np.random.SeedSequence().generate_state(1)[0])
         )
         local_rng = np.random.default_rng(base_seed)
@@ -1139,12 +1083,14 @@ class Wayfinder:
         )
 
         def pygmo_seed(stage_number, island_number, offset=0):
+            stage_number = int(stage_number) + int(stage_seed_offset)
             return int(
                 (base_seed * 1000003 + stage_number * 10007
                  + island_number * 101 + offset) % (2 ** 32)
             )
 
         for stage_index, stage in enumerate(stage_plan, start=1):
+            recorded_stage_index = int(stage_index_offset) + int(stage_index)
             stage_started_at = time.perf_counter()
             stage_topology = stage.get("topology", topology)
             migration_rate = int(stage.get("migration_rate", 2))
@@ -1159,20 +1105,36 @@ class Wayfinder:
             problem = pg.problem(
                 pg.decorator_problem(udp, fitness_decorator=fitness_decorator)
             )
+            split_ring = stage.get("split_ring")
             archi = pg.archipelago(
                 t=self._make_archipelago_topology(
-                    stage_topology, stage["n_island"]
+                    "unconnected" if split_ring else stage_topology,
+                    stage["n_island"],
                 ),
             )
             phase_elite_groups = None
             if seed_genes:
                 if stage["initialization"] == "scout_diverse":
+                    selection_problem = (
+                        exact_problem
+                        if stage.get("selection_problem") == "exact"
+                        else problem
+                    )
                     seed_genes = self._select_phase_diverse_elites(
                         job,
-                        problem,
+                        selection_problem,
                         seed_genes,
                         stage["n_island"],
-                        elite_fraction=0.75,
+                        elite_fraction=stage.get("elite_fraction", 0.75),
+                        selection_policy=stage.get(
+                            "selection_policy", "phase_farthest",
+                        ),
+                        barrier_relative_tolerance=stage.get(
+                            "barrier_relative_tolerance", 0.0,
+                        ),
+                        valley_slot_fraction=stage.get(
+                            "valley_slot_fraction", 1.0,
+                        ),
                     )
                 elif stage["initialization"] == "phase_elites_mixed":
                     selected_elites = self._select_phase_diverse_elites(
@@ -1181,6 +1143,9 @@ class Wayfinder:
                         seed_genes,
                         stage["n_island"] * stage["island_pop"],
                         elite_fraction=stage.get("elite_fraction", 0.35),
+                        selection_policy=stage.get(
+                            "selection_policy", "phase_farthest",
+                        ),
                     )
                     phase_elite_groups = [
                         selected_elites[index::stage["n_island"]]
@@ -1197,11 +1162,26 @@ class Wayfinder:
                     seed_genes = self._select_exact_diverse_seeds(
                         problem, seed_genes, stage["n_island"]
                     )
+                elif stage["initialization"] == "preselected":
+                    seed_genes = [
+                        list(gene) for gene in seed_genes[:stage["n_island"]]
+                    ]
                 else:
                     seed_genes = sorted(
                         seed_genes,
                         key=lambda gene: float(problem.fitness(gene)[0]),
                     )[:stage["n_island"]]
+                if (
+                    phase_elite_groups is None
+                    and seed_genes
+                    and len(seed_genes) < stage["n_island"]
+                ):
+                    repeated_seed_genes = []
+                    for index in range(stage["n_island"]):
+                        repeated_seed_genes.append(
+                            list(seed_genes[index % len(seed_genes)])
+                        )
+                    seed_genes = repeated_seed_genes
             stage_algorithms = []
             for island_index in range(stage["n_island"]):
                 if phase_elite_groups is not None:
@@ -1234,7 +1214,23 @@ class Wayfinder:
                         seed=pygmo_seed(stage_index, island_index, 17),
                     )
 
-                if stage["algorithm"] == "sade_nlopt" and island_index % 2 == 1:
+                if stage["algorithm"] == "mbh":
+                    inner = pg.nlopt("neldermead")
+                    inner.maxeval = max(
+                        1, stage["sade_gen"] * stage["island_pop"] - 1
+                    )
+                    inner.xtol_rel = 0.0
+                    inner.ftol_rel = 0.0
+                    inner.selection = "best"
+                    inner.replacement = "best"
+                    algorithm = pg.mbh(
+                        inner,
+                        stop=int(stage.get("mbh_stop", 3)),
+                        perturb=float(stage.get("mbh_perturb", 0.05)),
+                        seed=pygmo_seed(stage_index, island_index, 31),
+                    )
+                    algorithm_name = "mbh_nlopt_neldermead"
+                elif stage["algorithm"] == "sade_nlopt" and island_index % 2 == 1:
                     algorithm = pg.nlopt("neldermead")
                     algorithm.maxeval = max(
                         1, stage["sade_gen"] * stage["island_pop"] - 1
@@ -1244,7 +1240,10 @@ class Wayfinder:
                     algorithm.selection = "best"
                     algorithm.replacement = "best"
                     algorithm_name = "nlopt_neldermead"
-                elif stage["algorithm"] in ("sade", "sade_nlopt") or island_index % 2 == 0:
+                elif (
+                    stage["algorithm"] in ("sade", "sade_nlopt")
+                    or (stage["algorithm"] == "hybrid" and island_index % 2 == 0)
+                ):
                     algorithm = pg.sade(
                         gen=stage["sade_gen"],
                         memory=True,
@@ -1271,6 +1270,19 @@ class Wayfinder:
                     pop=population,
                     s_pol=pg.select_best(migration_rate),
                     r_pol=pg.fair_replace(migration_rate),
+                ))
+
+            if split_ring:
+                current_islands = int(split_ring["current_islands"])
+                alternative_islands = int(split_ring["alternative_islands"])
+                if current_islands + alternative_islands != stage["n_island"]:
+                    raise ValueError(
+                        "Split-ring partitions do not match stage island count"
+                    )
+                archi.set_topology(self._make_split_ring_topology(
+                    current_islands=current_islands,
+                    alternative_islands=alternative_islands,
+                    bridge_weight=split_ring.get("bridge_weight", 0.25),
                 ))
 
             logger.info(
@@ -1361,8 +1373,21 @@ class Wayfinder:
                 sqlite_run_id,
                 global_step,
                 populations,
-                source="stage_{}_final".format(stage_index),
+                source=(
+                    "stage_{}_final".format(stage_index)
+                    if branch_label == "baseline"
+                    else "{}_stage_{}_final".format(branch_label, stage_index)
+                ),
             )
+            if (
+                pressure_cascade
+                and pressure_cascade.get("enabled")
+                and branch_label == "baseline"
+                and stage_index == int(pressure_cascade.get("source_stage_index", 1))
+            ):
+                pressure_observation = self._funnel_pressure_observation(
+                    job, populations, pressure_cascade,
+                )
             champion_pairs = sorted(
                 zip(archi.get_champions_f(), archi.get_champions_x()),
                 key=lambda pair: float(pair[0][0]),
@@ -1370,7 +1395,46 @@ class Wayfinder:
             if stage_index < len(stage_plan):
                 next_stage = stage_plan[stage_index]
                 next_island_count = next_stage["n_island"]
-                if (
+                if next_stage.get("selection_policy") == "portfolio_16_4_l0":
+                    current_seeds = self._select_phase_diverse_elites(
+                        job,
+                        problem,
+                        [list(gene) for _, gene in champion_pairs],
+                        16,
+                        elite_fraction=0.75,
+                        selection_policy="phase_farthest",
+                    )
+                    all_population_genes = [
+                        list(gene)
+                        for population in populations
+                        for gene in population.get_x()
+                    ]
+                    alternative_seeds = self._select_phase_diverse_elites(
+                        job,
+                        problem,
+                        all_population_genes,
+                        16,
+                        elite_fraction=0.35,
+                        selection_policy="hill_valley_l0",
+                    )
+                    seed_genes = list(current_seeds)
+                    selected_keys = {
+                        tuple(float(value) for value in gene)
+                        for gene in seed_genes
+                    }
+                    for gene in alternative_seeds:
+                        key = tuple(float(value) for value in gene)
+                        if key in selected_keys:
+                            continue
+                        seed_genes.append(list(gene))
+                        selected_keys.add(key)
+                        if len(seed_genes) == next_island_count:
+                            break
+                    if len(seed_genes) != next_island_count:
+                        raise ValueError(
+                            "Insufficient distinct seeds for 16+4 portfolio"
+                        )
+                elif (
                     next_stage["ejection_model"] == "vector_3d"
                     or next_stage["initialization"] == "phase_elites_mixed"
                 ):
@@ -1394,9 +1458,19 @@ class Wayfinder:
                                 source="exact_archive_stage3_seed",
                             )
                 elif next_stage["initialization"] == "scout_diverse":
-                    seed_genes = [
-                        list(gene) for _, gene in champion_pairs
-                    ]
+                    if next_stage.get("selection_policy") in (
+                        "hill_valley_l0", "hill_valley_p2_l0",
+                        "hill_valley_mr_l0", "hill_valley_mr32_l0",
+                    ):
+                        seed_genes = [
+                            list(gene)
+                            for population in populations
+                            for gene in population.get_x()
+                        ]
+                    else:
+                        seed_genes = [
+                            list(gene) for _, gene in champion_pairs
+                        ]
                 else:
                     seed_genes = [
                         list(champion_pairs[index][1])
@@ -1406,8 +1480,12 @@ class Wayfinder:
                 seed_genes = None
             stage_runtime = time.perf_counter() - stage_started_at
             stage_summary = {
-                "stage_index": stage_index,
-                "stage_name": stage["name"],
+                "stage_index": recorded_stage_index,
+                "stage_name": (
+                    stage["name"]
+                    if branch_label == "baseline"
+                    else "{}::{}".format(branch_label, stage["name"])
+                ),
                 "n_island": stage["n_island"],
                 "island_pop": stage["island_pop"],
                 "sade_gen": stage["sade_gen"],
@@ -1415,6 +1493,9 @@ class Wayfinder:
                 "actual_evo_steps": stage_steps,
                 "ejection_model": stage["ejection_model"],
                 "initialization": stage["initialization"],
+                "selection_policy": stage.get(
+                    "selection_policy", "phase_farthest",
+                ),
                 "topology": stage_topology,
                 "migration_rate": migration_rate,
                 "exact_archive_size": len(exact_archive_genes),
@@ -1439,7 +1520,7 @@ class Wayfinder:
         idx = sols.index(min(sols))
         gene = copy.copy(list(final_archipelago.get_champions_x()[idx]))
         decoded = decode_trajectory(udp, gene, planet_pack=self.planet_pack)
-        return {
+        result = {
             "job_id": int(job["job_id"]),
             "run_id": sqlite_run_id,
             "gene": gene,
@@ -1454,32 +1535,375 @@ class Wayfinder:
             "actual_n_evo_steps": total_steps,
             "stop_reason": "funnel_complete",
             "optimizer_strategy": (
-                "funnel" if exact_strategy == "legacy"
-                else (
-                    (
-                        "funnel_phase_elites_equal"
-                        if exact_strategy == "phase_elites_nm_equal"
-                        else (
-                            {
-                                "scout_archive_nm": "funnel_scout_archive",
-                                "scout_archive_nm_32": "funnel_scout_archive_32",
-                                "scout_archive_nm_64": "funnel_scout_archive_64",
-                                "scout_archive_nm_128": "funnel_scout_archive_128",
-                            }[exact_strategy]
-                            if exact_strategy.startswith("scout_archive_nm")
-                            else "funnel_phase_elites_nm"
-                        )
-                    )
-                    if exact_strategy in (
-                        "phase_elites_nm", "phase_elites_nm_equal",
-                        "scout_archive_nm", "scout_archive_nm_32",
-                        "scout_archive_nm_64", "scout_archive_nm_128",
-                    )
-                    else "funnel_{}_exact".format(exact_strategy)
+                requested_optimizer_strategy
+                if requested_optimizer_strategy is not None
+                else self._canonical_optimizer_strategy_from_exact_strategy(
+                    exact_strategy
                 )
             ),
             "stage_summaries": stage_summaries,
+            "last_global_step": global_step,
+            "branch_label": branch_label,
         }
+        if (
+            pressure_cascade
+            and pressure_cascade.get("enabled")
+            and branch_label == "baseline"
+        ):
+            return self._run_pressure_cascade_rescue(
+                store=store,
+                job=job,
+                baseline_udp=udp,
+                baseline_result=result,
+                pressure_observation=pressure_observation,
+                sqlite_run_id=sqlite_run_id,
+                sade_gen=sade_gen,
+                requested_n_island=requested_n_island,
+                n_island=n_island,
+                island_pop=island_pop,
+                n_evo_steps=n_evo_steps,
+                topology=topology,
+                versions=versions,
+                adaptive_stop=adaptive_stop,
+                soi_radius_by_name=soi_radius_by_name,
+                exact_strategy=exact_strategy,
+                requested_optimizer_strategy=requested_optimizer_strategy,
+                effective_optimizer_seed=base_seed,
+                initial_seed_genes=initial_seed_genes,
+                pressure_cascade=pressure_cascade,
+                renew_claim=renew_claim,
+            )
+        return result
+
+    def _funnel_pressure_observation(self, job, populations, pressure_cascade):
+        """Summarize L0 leg-TOF boundary pressure from top population points."""
+        if job.get("tof_encoding") != "direct":
+            return None
+        serialized_bounds = job.get("leg_tof_bounds_json")
+        if not serialized_bounds:
+            return None
+        bounds = json.loads(serialized_bounds)
+        bodies = json.loads(job["bodies_json"])
+        n_legs = len(bodies) - 1
+        top = max(1, int(pressure_cascade.get("top", 32)))
+        ranked = sorted(
+            (
+                (float(fitness[0]), list(gene))
+                for population in populations
+                for fitness, gene in zip(population.get_f(), population.get_x())
+            ),
+            key=lambda item: item[0],
+        )[:top]
+        tof_vectors = [
+            [
+                float(value) * self._Edy2Kdy
+                for value in direct_leg_tofs(gene, n_legs)
+            ]
+            for _, gene in ranked
+        ]
+        fitnesses = [float(fitness) for fitness, _ in ranked]
+        actions = OptimizationService.tof_boundary_pressure_actions(
+            bounds,
+            tof_vectors,
+            near_fraction=pressure_cascade.get("near_fraction", 0.03),
+            min_pressure_count=pressure_cascade.get("min_pressure_count", 2),
+        )
+        return {
+            "bounds": bounds,
+            "tof_vectors": tof_vectors,
+            "fitnesses": fitnesses,
+            "actions": actions,
+        }
+
+    @staticmethod
+    def _job_with_leg_tof_bounds(job, leg_tof_bounds):
+        updated = dict(job)
+        updated["leg_tof_bounds_json"] = json.dumps(
+            [[float(low), float(high)] for low, high in leg_tof_bounds],
+            separators=(",", ":"),
+        )
+        return updated
+
+    def _run_pressure_cascade_rescue(
+        self,
+        store,
+        job,
+        baseline_udp,
+        baseline_result,
+        pressure_observation,
+        sqlite_run_id,
+        sade_gen,
+        requested_n_island,
+        n_island,
+        island_pop,
+        n_evo_steps,
+        topology,
+        versions,
+        adaptive_stop,
+        soi_radius_by_name,
+        exact_strategy,
+        requested_optimizer_strategy,
+        effective_optimizer_seed,
+        initial_seed_genes,
+        pressure_cascade,
+        renew_claim=None,
+    ):
+        """Run same-seed/retry adjusted-bounds branches when L0 is pressured."""
+        del baseline_udp  # The baseline result is already decoded.
+        executed_results = [baseline_result]
+        selected_result = baseline_result
+        cascade_info = {
+            "enabled": True,
+            "triggered": False,
+            "actions": [],
+            "adjusted_bounds": None,
+            "selected_branch": baseline_result.get("branch_label", "baseline"),
+            "branches": [
+                {
+                    "branch": baseline_result.get("branch_label", "baseline"),
+                    "dv": float(baseline_result["result_DV"]),
+                    "seed": int(effective_optimizer_seed),
+                }
+            ],
+        }
+        if not pressure_observation or not pressure_observation.get("actions"):
+            baseline_result["pressure_cascade"] = cascade_info
+            return baseline_result
+
+        summaries = baseline_result.get("stage_summaries", [])
+        source_index = max(
+            1, int(pressure_cascade.get("source_stage_index", 1))
+        ) - 1
+        l0_summary = summaries[source_index] if len(summaries) > source_index else None
+        l1_summary = (
+            summaries[source_index + 1]
+            if len(summaries) > source_index + 1 else None
+        )
+        l0_best = l0_summary.get("best_fitness") if l0_summary else None
+        l1_best = l1_summary.get("best_fitness") if l1_summary else None
+        l1_improvement = (
+            (float(l0_best) - float(l1_best)) / float(l0_best)
+            if l0_best not in (None, 0.0) and l1_best is not None
+            else None
+        )
+        l0_fitnesses = pressure_observation.get("fitnesses") or []
+        l0_median = float(np.median(l0_fitnesses)) if l0_fitnesses else None
+        l1_best_to_l0_median = (
+            float(l1_best) / float(l0_median)
+            if l1_best is not None and l0_median not in (None, 0.0)
+            else None
+        )
+        cascade_info.update({
+            "actions": pressure_observation["actions"],
+            "l1_improvement": l1_improvement,
+            "l1_best_to_l0_median": l1_best_to_l0_median,
+        })
+        should_branch = OptimizationService.pressure_branch_decision(
+            pressure_observation["actions"],
+            policy=pressure_cascade.get("branch_policy", "l1_combined"),
+            l1_improvement=l1_improvement,
+            max_l1_improvement=pressure_cascade.get("max_l1_improvement", 0.15),
+            l1_best_to_l0_median=l1_best_to_l0_median,
+            min_l1_best_to_l0_median=pressure_cascade.get(
+                "min_l1_best_to_l0_median", 0.725,
+            ),
+        )
+        if not should_branch:
+            baseline_result["pressure_cascade"] = cascade_info
+            return baseline_result
+
+        adjusted_bounds, deltas, modes = OptimizationService.adjust_leg_tof_bounds(
+            pressure_observation["bounds"],
+            pressure_observation["actions"],
+            relax_fraction=pressure_cascade.get("relax_fraction", 0.20),
+            min_relax_days=pressure_cascade.get("min_relax_days", 5.0),
+            max_relax_days=pressure_cascade.get("max_relax_days", 60.0),
+            min_leg_lower_days=pressure_cascade.get("min_leg_lower_days", 1.0),
+            adjustment_mode=pressure_cascade.get("adjustment_mode", "widen"),
+        )
+        cascade_info.update({
+            "triggered": True,
+            "adjusted_bounds": adjusted_bounds,
+            "deltas": {
+                "{}:{}".format(leg, side): float(delta)
+                for (leg, side), delta in deltas.items()
+            },
+            "adjustment_modes": {
+                "{}:{}".format(leg, side): mode
+                for (leg, side), mode in modes.items()
+            },
+        })
+        adjusted_job = self._job_with_leg_tof_bounds(job, adjusted_bounds)
+
+        same_seed_result = self._run_sqlite_funnel_job(
+            store,
+            adjusted_job,
+            self._mga_problem_from_sqlite_context(adjusted_job),
+            sqlite_run_id,
+            sade_gen=sade_gen,
+            requested_n_island=requested_n_island,
+            n_island=n_island,
+            island_pop=island_pop,
+            n_evo_steps=n_evo_steps,
+            topology=topology,
+            versions=versions,
+            adaptive_stop=adaptive_stop,
+            soi_radius_by_name=soi_radius_by_name,
+            exact_strategy=exact_strategy,
+            requested_optimizer_strategy=requested_optimizer_strategy,
+            effective_optimizer_seed=effective_optimizer_seed,
+            initial_seed_genes=initial_seed_genes,
+            pressure_cascade=None,
+            branch_label="pressure_same_seed",
+            stage_index_offset=100,
+            step_offset=baseline_result["last_global_step"],
+            renew_claim=renew_claim,
+        )
+        executed_results.append(same_seed_result)
+        cascade_info["branches"].append({
+            "branch": "pressure_same_seed",
+            "dv": float(same_seed_result["result_DV"]),
+            "seed": int(effective_optimizer_seed),
+        })
+        if float(same_seed_result["result_DV"]) < float(selected_result["result_DV"]):
+            selected_result = same_seed_result
+
+        relaxed_dv = float(same_seed_result["result_DV"])
+        run_retry = pressure_cascade.get("rescue_mode", "cascade") in (
+            "retry_seed", "both",
+        )
+        if pressure_cascade.get("rescue_mode", "cascade") == "cascade":
+            run_retry = OptimizationService.pressure_retry_decision(
+                baseline_result["result_DV"],
+                selected_result["result_DV"],
+                relaxed_dv,
+                min_improvement=pressure_cascade.get(
+                    "cascade_min_improvement", 0.10,
+                ),
+            )
+        if run_retry:
+            retry_seed = int(effective_optimizer_seed) + int(
+                pressure_cascade.get("retry_seed_offset", 100)
+            )
+            retry_result = self._run_sqlite_funnel_job(
+                store,
+                adjusted_job,
+                self._mga_problem_from_sqlite_context(adjusted_job),
+                sqlite_run_id,
+                sade_gen=sade_gen,
+                requested_n_island=requested_n_island,
+                n_island=n_island,
+                island_pop=island_pop,
+                n_evo_steps=n_evo_steps,
+                topology=topology,
+                versions=versions,
+                adaptive_stop=adaptive_stop,
+                soi_radius_by_name=soi_radius_by_name,
+                exact_strategy=exact_strategy,
+                requested_optimizer_strategy=requested_optimizer_strategy,
+                effective_optimizer_seed=retry_seed,
+                initial_seed_genes=initial_seed_genes,
+                pressure_cascade=None,
+                branch_label="pressure_retry_seed",
+                stage_index_offset=200,
+                step_offset=same_seed_result["last_global_step"],
+                renew_claim=renew_claim,
+            )
+            executed_results.append(retry_result)
+            cascade_info["branches"].append({
+                "branch": "pressure_retry_seed",
+                "dv": float(retry_result["result_DV"]),
+                "seed": int(retry_seed),
+            })
+            if float(retry_result["result_DV"]) < float(selected_result["result_DV"]):
+                selected_result = retry_result
+
+        final_result = copy.copy(selected_result)
+        final_result["actual_n_evo_steps"] = sum(
+            int(result["actual_n_evo_steps"]) for result in executed_results
+        )
+        final_result["last_global_step"] = max(
+            int(result["last_global_step"]) for result in executed_results
+        )
+        final_result["stage_summaries"] = [
+            summary
+            for result in executed_results
+            for summary in result.get("stage_summaries", [])
+        ]
+        cascade_info["selected_branch"] = final_result.get(
+            "branch_label", "baseline",
+        )
+        final_result["pressure_cascade"] = cascade_info
+        final_result["stop_reason"] = "funnel_pressure_cascade_complete"
+        return final_result
+
+    @staticmethod
+    def _canonical_optimizer_strategy_from_exact_strategy(exact_strategy):
+        if exact_strategy == "legacy":
+            return "funnel"
+        if exact_strategy == "phase_elites_nm_equal":
+            return "funnel_phase_elites_equal"
+        if exact_strategy == "phase_elites_nm":
+            return "funnel_phase_elites_nm"
+        scout_names = {
+            "scout_archive_nm": "funnel_scout_archive",
+            "scout_archive_nm_32": "funnel_scout_archive_32",
+            "scout_archive_nm_64": "funnel_scout_archive_64",
+            "scout_archive_nm_128": "funnel_scout_archive_128",
+        }
+        if exact_strategy in scout_names:
+            return scout_names[exact_strategy]
+        parts = str(exact_strategy).split("_")
+        if (
+            5 <= len(parts) <= 13
+            and parts[:3] == ["scout", "archive", "nm"]
+            and parts[3] in ("32", "64", "128")
+        ):
+            suffixes = parts[4:]
+            strategy_parts = ["funnel", "l0", "recall", parts[3]]
+            if suffixes and suffixes[0].startswith("g"):
+                if not suffixes[0][1:].isdigit():
+                    return "funnel_{}_exact".format(exact_strategy)
+                strategy_parts.append(suffixes.pop(0))
+            if suffixes and suffixes[0].startswith("w"):
+                if not suffixes[0][1:].isdigit():
+                    return "funnel_{}_exact".format(exact_strategy)
+                strategy_parts.append(suffixes.pop(0))
+            if suffixes and suffixes[0] == "mbh":
+                if len(suffixes) < 2 or suffixes[1] not in ("between", "l2"):
+                    return "funnel_{}_exact".format(exact_strategy)
+                strategy_parts.extend(["mbh", suffixes[1]])
+                suffixes = suffixes[2:]
+            if suffixes[:2] == ["pareto", "l0"]:
+                strategy_parts.extend(["pareto", "l0"])
+                suffixes = suffixes[2:]
+            elif suffixes and suffixes[0] == "pareto":
+                strategy_parts.append("pareto")
+                suffixes = suffixes[1:]
+            elif suffixes[:2] == ["basin", "l0"]:
+                strategy_parts.extend(["basin", "l0"])
+                suffixes = suffixes[2:]
+            elif suffixes[:4] == ["hill", "valley", "p2", "l0"]:
+                strategy_parts.extend(["hill", "valley", "p2", "l0"])
+                suffixes = suffixes[4:]
+            elif suffixes[:4] == ["hill", "valley", "mr", "l0"]:
+                strategy_parts.extend(["hill", "valley", "mr", "l0"])
+                suffixes = suffixes[4:]
+            elif suffixes[:4] == ["hill", "valley", "mr32", "l0"]:
+                strategy_parts.extend(["hill", "valley", "mr32", "l0"])
+                suffixes = suffixes[4:]
+            elif suffixes[:3] == ["hill", "valley", "l0"]:
+                strategy_parts.extend(["hill", "valley", "l0"])
+                suffixes = suffixes[3:]
+            elif suffixes[:4] == ["portfolio", "16", "4", "l0"]:
+                strategy_parts.extend(["portfolio", "16", "4", "l0"])
+                suffixes = suffixes[4:]
+            if suffixes == ["exact"]:
+                strategy_parts.append("exact")
+            elif suffixes:
+                return "funnel_{}_exact".format(exact_strategy)
+            return "_".join(strategy_parts)
+        return "funnel_{}_exact".format(exact_strategy)
 
     @staticmethod
     def _adaptive_stop_decision(history, plateau_windows, options):
@@ -1553,8 +1977,14 @@ class Wayfinder:
         optimizer_strategy=DEFAULT_OPTIMIZER_STRATEGY,
         worker_id=None,
         claim_lease_seconds=86400,
+        initial_seed_genes=None,
     ):
-        """Atomically claim and optimize SQLite jobs, then persist results."""
+        """Atomically claim and optimize SQLite jobs, then persist results.
+
+        ``initial_seed_genes`` remains an experimental caller override. Normal
+        sequence-scout continuation jobs recover their parent L0 population
+        through persisted SQL lineage and do not require this argument.
+        """
         from _SQLiteStore import SQLiteJobStore
 
         versions = {
@@ -1600,6 +2030,7 @@ class Wayfinder:
                     adaptive_stop=adaptive_options,
                     optimizer_strategy=optimizer_strategy,
                     claim_lease_seconds=claim_lease_seconds,
+                    initial_seed_genes=initial_seed_genes,
                 )
                 count += 1
                 logger.info(
@@ -3573,6 +4004,143 @@ class Wayfinder:
                 seq_name += self._Body_abrev_dic[body]
             shortSequences.append(seq_name)
         return shortSequences
+
+    def scout_sequences(
+        self,
+        start,
+        target,
+        candidate_bodies=None,
+        config=None,
+        limit=None,
+        as_dict=False,
+    ):
+        """Return unphased Tisserand/tree candidates upstream of L0.
+
+        This is an energy-reachability scout, not a trajectory solver. Epoch,
+        phasing, inclination and time of flight are deliberately left to the
+        next Lambert arc-1 filter and the normal optimizer funnel.
+        """
+        if config is None:
+            config = TisserandScoutConfig()
+        elif isinstance(config, dict):
+            config = TisserandScoutConfig(**config)
+        elif not isinstance(config, TisserandScoutConfig):
+            raise TypeError(
+                "config must be a TisserandScoutConfig, dict, or None"
+            )
+        candidates = SequenceScout(
+            self._planet_pack_module, config=config,
+        ).scout(
+            start=start,
+            target=target,
+            candidate_bodies=candidate_bodies,
+            limit=limit,
+        )
+        if as_dict:
+            return [candidate.to_dict() for candidate in candidates]
+        return candidates
+
+    def filter_scout_sequences_arc1(
+        self,
+        candidates,
+        t0_bounds_days,
+        config=None,
+        accepted_only=True,
+        as_dict=False,
+    ):
+        """Apply the zero-revolution PyKEP Lambert first-arc filter."""
+        if config is None:
+            config = LambertArc1Config()
+        elif isinstance(config, dict):
+            config = LambertArc1Config(**config)
+        elif not isinstance(config, LambertArc1Config):
+            raise TypeError("config must be a LambertArc1Config, dict, or None")
+        arc_filter = LambertArc1Filter(
+            self._planet_pack_module, config=config,
+        )
+        if accepted_only:
+            assessments = arc_filter.filter(candidates, t0_bounds_days)
+        else:
+            assessments = arc_filter.assess(candidates, t0_bounds_days)
+        if as_dict:
+            return [assessment.to_dict() for assessment in assessments]
+        return assessments
+
+    def scan_scout_sequence_bins(
+        self,
+        candidates,
+        t0_bounds_days,
+        config=None,
+        as_dict=False,
+        **scan_options,
+    ):
+        """Scan Tisserand/Lambert first-arc candidates in fixed T0 bins."""
+        if config is None:
+            config = LambertArc1Config()
+        elif isinstance(config, dict):
+            config = LambertArc1Config(**config)
+        elif not isinstance(config, LambertArc1Config):
+            raise TypeError("config must be a LambertArc1Config, dict, or None")
+        result = LambertArc1Filter(
+            self._planet_pack_module, config=config,
+        ).scan_t0_bins(
+            candidates,
+            t0_bounds_days,
+            **scan_options,
+        )
+        return result.to_dict() if as_dict else result
+
+    def prepare_sequence_scout_sqlite(
+        self, db_path, name, start_body, target_body, config=None,
+        candidate_bodies=None, scout_config=None, lambert_config=None,
+    ):
+        """Persist a Tisserand/Lambert scout and create its pending L0 jobs."""
+        if config is None:
+            config = SequenceScoutWorkflowConfig()
+        elif isinstance(config, dict):
+            config = SequenceScoutWorkflowConfig(**config)
+        elif not isinstance(config, SequenceScoutWorkflowConfig):
+            raise TypeError(
+                "config must be a SequenceScoutWorkflowConfig, dict, or None"
+            )
+        return SequenceScoutSQLWorkflow(self).prepare(
+            db_path, name, start_body, target_body, config=config,
+            candidate_bodies=candidate_bodies, scout_config=scout_config,
+            lambert_config=lambert_config,
+        )
+
+    def promote_sequence_scout_sqlite(
+        self, db_path, scout_run_id, per_bin=None, allow_partial=False,
+    ):
+        """Create continuation jobs from the best completed L0 per T0 bin."""
+        return SequenceScoutSQLWorkflow(self).promote(
+            db_path, scout_run_id, per_bin=per_bin,
+            allow_partial=allow_partial,
+        )
+
+    def sequence_scout_status_sqlite(self, db_path, scout_run_id):
+        """Return persisted scout definition and job counts by workflow stage."""
+        return SequenceScoutSQLWorkflow(self).status(db_path, scout_run_id)
+
+    def optimize_sequence_scout_stage_sqlite(
+        self, db_path, scout_run_id, stage="l0", n=None, **optimizer_options,
+    ):
+        """Optimize pending jobs using the strategy persisted on each job."""
+        stage = str(stage).lower()
+        if stage not in ("l0", "funnel"):
+            raise ValueError("stage must be 'l0' or 'funnel'")
+        status = self.sequence_scout_status_sqlite(db_path, scout_run_id)
+        pending = int(status["job_counts"].get(stage + ":TODO", 0))
+        if n is None:
+            n = pending
+        batch_name = str(status["name"]) + "__" + stage
+        return self.optimize_sqlite(
+            db_path,
+            n=min(max(0, int(n)), pending),
+            batch_name=batch_name,
+            optimizer_strategy=None,
+            **optimizer_options,
+        )
     
     def orbital_period(self,planet):
         JNSQ_Dy2s = 12*3600

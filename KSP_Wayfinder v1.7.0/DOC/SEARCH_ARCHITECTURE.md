@@ -52,6 +52,41 @@ only: population-average noise otherwise prevented every early stop. Minimum
 and maximum evolution-step limits remain hard safeguards. Runs store the
 controller settings, actual step count, and stop reason in SQLite.
 
+## Sequence scout upstream of L0
+
+`SequenceScout` now provides the first explicit pre-L0 layer. It explores a
+sampled circular/coplanar Tisserand graph as a bounded tree, applying the real
+safe-periapsis turn limit of each planet and retaining multi-resolution energy
+states per body sequence. The public facade is
+`Wayfinder.scout_sequences(start, target, ...)`.
+
+The result is intentionally tagged `tisserand_circular_coplanar_unphased`.
+It is a list of energy-plausible body sequences, not a list of feasible timed
+trajectories. It neither creates jobs nor mutates SQLite.
+
+`LambertArc1Filter` is the next boundary and is now implemented separately. It
+uses real PyKEP ephemerides, a zero-revolution Lambert grid and the requested
+launch window. Its energy ceiling is a ratio to the best direct transfer found
+on the same grid; it also checks consistency with the first Tisserand flyby
+\(v_\infty\). It still does not claim downstream phasing feasibility. See
+[TISSERAND_SEQUENCE_SCOUT.md](TISSERAND_SEQUENCE_SCOUT.md) for the model,
+configuration and initial KEKKJ/KEEMo validation.
+
+The `scan_scout_sequence_bins()` view applies that boundary over
+fixed T0 bins. Its hard energy reference is the best direct parking-orbit
+ejection over the complete scan horizon, not the direct transfer available in
+the current bin. Schema v16 persists these candidates through
+`prepare_sequence_scout_sqlite()`, creates their L0 jobs, and records the
+relational lineage of every subsequent promotion.
+
+L0 screening uses the explicit per-job strategy `funnel_l0_screen`: 64
+unconnected PyGMO SADE islands, population 8, five 20-generation epochs. Once
+all L0 jobs are terminal, `promote_sequence_scout_sqlite()` selects the two
+best basins per T0 bin. The continuation job loads the persisted L0 population
+and executes `wide -> MBH -> intermediate -> exact_ejection`; it never repeats
+the scout stage. Both intended strategies and the canonical executed stage
+configuration are persisted for replay.
+
 ## Optimization funnel
 
 For release 1.6, `optimize_sqlite()` deliberately keeps the corrected
@@ -80,14 +115,41 @@ from the archive plus the final L2 population. L0 variants expose 32, 64 and
 128 islands at an equal 128,000-evaluation budget. The 128-island variant is
 rejected; 32 remains the next qualification candidate.
 
+The public L0-oriented aliases are:
+
+- `funnel_l0_recall`: default L0 recall policy, currently the 64-island
+  scout/archive compromise;
+- `funnel_l0_recall_32`, `_64`, `_128`: explicit equal-budget width variants.
+
+The pressure-cascade production candidate is explicit as
+`funnel_l0_recall_64_mbh_between_pressure_cascade`. A separate experimental
+strategy,
+`funnel_l0_recall_64_mbh_between_portfolio_16_4_l0_pressure_cascade`, keeps all
+16 normal L1 seeds and adds four strict Hill-Valley alternatives. L1 uses two
+bidirectional Pygmo rings joined by one weak bridge; later stages return to the
+normal MBH/L2/L3 plan. The complete split, bridge weight, topology dimensions
+and migration telemetry are serialized for replay. This option improved both
+KEEMo and KEKKJ in the paired benchmark, but remains opt-in because the test
+does not yet separate the value of the topology from the added island budget.
+
+These aliases intentionally keep the same optimizer mechanics as the older
+`funnel_scout_archive*` names, but they name the architectural role more
+clearly: L0 is a wide, shallow, approximate-fitness recall stage whose job is
+to preserve plausible basins before L1 spends meaningful optimizer budget.
+It is still local to a known sequence. The later `SequenceScout` layer should
+sit above this contract and generate plausible body sequences and coarse
+leg-bound hypotheses for the optimizer to verify.
+
 Island counts decrease monotonically whenever more than one worker is
 available. Seeding replaces one random individual rather than increasing the
 configured population size. The first two stages alternate SADE and simulated
 annealing correctly; the v1.5 prototype accidentally inserted the annealing
 island twice. PyKEP's configured arrival/capture objective remains active at
-all stages. SQLite schema v14 stores per-stage island/population settings,
+all stages. SQLite schema v16 stores per-stage island/population settings,
 initialization, topology name, migration rate, exact archive size, adaptive
-controller, algorithms, best/average fitness, runtime and stop reason.
+controller, algorithms, best/average fitness, runtime and stop reason. It also
+stores run-level replay metadata: effective optimizer seed, canonical funnel
+configuration JSON and hash, best-effort code revision and planet-pack hash.
 
 ## Job ownership
 

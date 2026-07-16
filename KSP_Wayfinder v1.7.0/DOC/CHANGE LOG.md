@@ -39,6 +39,40 @@
 - added DV vs T0 plot for aritrary sequences in all possible forms, including combinatorial. Very nice.
 - added a few tests
 
+### v1.7.0
+
+- Extracted optimizer policy and serializable funnel/stage configuration from
+  the historical `Wayfinder` facade into a dedicated optimization service.
+- Added deterministic replay metadata in SQLite schema v15: effective seed,
+  canonical funnel configuration/hash, code revision and planet-pack hash.
+- Added the Tisserand/tree sequence scout and zero-revolution PyKEP Lambert
+  first-arc filter for automatic preselection of energy-plausible MGA routes.
+- Added fixed-T0-bin scouting against one global direct-ejection reference and
+  conservative per-leg direct-encoding bounds.
+- Qualified the `Tisserand/Lambert -> L0 -> funnel` workflow on Vanilla
+  Kerbin-to-Jool: 119 L0 screens, 20 promoted funnels and a recovered KEKKJ
+  solution at 1263.7 m/s in the day 600-700 departure bin.
+- SQLite schema v16 persists scout definitions, sequence/bin candidates,
+  per-job optimizer strategy and relational L0-to-funnel lineage.
+- Added SQL-native L0 screening and promotion. Continuation jobs reload the
+  persisted L0 population and start at L1 instead of paying for L0 twice;
+  premature promotion is rejected by default.
+- Added pressure-cascade, MBH and phase-diversity experiments plus complete
+  convergence/runtime benchmark reporting. Experimental Pareto, Hill-Valley
+  and split-ring policies remain opt-in where qualification was inconclusive.
+- Unified exact parking-orbit ejection fitness and decoding, including the
+  cheaper of direct inclined ejection and planar ejection plus normal SOI
+  correction.
+- Added explicit terminal modes for free flyby, terminal-v-infinity,
+  circular capture and elliptical capture objectives.
+- Added a finite-SOI PyKEP-to-KSP translation layer, detailed B-plane/flyby
+  flight-plan data and optional kRPC maneuver-node injection for manual
+  leg-by-leg validation in KSP.
+- Standardized benchmark analysis helpers and retained the supporting reports
+  and plots under `DOC/`.
+- Release qualification: 106 tests and 36 subtests pass in the pinned Conda
+  environment.
+
 ### v1.6.0
 
 - Fixed Pygmo topology construction: ring and fully-connected archipelagos no
